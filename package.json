@@ -27,7 +27,9 @@
     "start": "node dist/server.js",
     "dev": "node --import tsx src/server.ts",
     "test": "npm run build && node --import tsx --test test/*.test.ts",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "smithery:publish": "bash scripts/smithery-publish.sh",
+    "smithery:uplink": "bash scripts/smithery-publish.sh --uplink-dev"
   },
   "keywords": [
     "mcp",
