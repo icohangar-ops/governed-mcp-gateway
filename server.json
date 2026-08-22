@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.icohangar-ops/governed-mcp-gateway",
+  "description": "HTTP MCP gateway: principal on tools/call + SSE, allowlists, vault rotate, CHP gates.",
+  "repository": {
+    "url": "https://github.com/icohangar-ops/governed-mcp-gateway",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@cubiczan/governed-mcp-gateway",
+      "version": "0.1.0",
+      "transport": {
+        "type": "sse",
+        "url": "http://127.0.0.1:7474/mcp/sse"
+      }
+    }
+  ]
+}
