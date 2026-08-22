@@ -1,5 +1,9 @@
 # @cubiczan/governed-mcp-gateway
 
+[![npm](https://img.shields.io/npm/v/@cubiczan/governed-mcp-gateway)](https://www.npmjs.com/package/@cubiczan/governed-mcp-gateway)
+[![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.icohangar--ops%2Fgoverned--mcp--gateway-00C4B4)](https://registry.modelcontextprotocol.io)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 HTTP MCP **control plane** (default port **7474**). Principal on every `tools/call` and every SSE frame — not a tool catalog.
 
 Production MCP auth often dies when work hops threads or workers. This gateway resolves a Bearer credential to a **Principal**, injects it into `params._meta.cubiczan.principal`, repeats it on SSE, enforces allowlists, rotates vaulted secrets in place, and runs a lightweight CHP spend gate before priced tools.
