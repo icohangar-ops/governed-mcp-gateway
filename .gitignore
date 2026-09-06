@@ -1,7 +1,9 @@
 node_modules/
 dist/
-dist-test/
-*.tsbuildinfo
-.DS_Store
+.data/
 .env
+.env.*
+!.env.example
 *.log
+.DS_Store
+coverage/

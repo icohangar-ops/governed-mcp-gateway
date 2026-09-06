@@ -1,65 +1,23 @@
 {
-  "name": "@cubiczan/governed-mcp-gateway",
+  "name": "cubiczan-agent-platform",
+  "private": true,
   "version": "0.1.0",
-  "description": "HTTP MCP gateway: principal on tools/call + SSE, allowlists, vault rotate, CHP gates",
-  "mcpName": "io.github.icohangar-ops/governed-mcp-gateway",
-  "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
-  },
-  "bin": {
-    "governed-mcp-gateway": "./bin/governed-mcp-gateway.js"
-  },
-  "files": [
-    "dist",
-    "bin",
-    "README.md",
-    "LICENSE",
-    "server.json"
+  "description": "Governed MCP Gateway, Agent Spend & Mandate Plane, and Auditable CFO Agent Mesh",
+  "workspaces": [
+    "packages/shared",
+    "packages/governed-mcp-gateway",
+    "packages/spend-mandate-plane",
+    "packages/cfo-agent-mesh"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js",
-    "dev": "node --import tsx src/server.ts",
-    "test": "npm run build && node --import tsx --test test/*.test.ts",
-    "prepublishOnly": "npm run build",
-    "smithery:publish": "bash scripts/smithery-publish.sh",
-    "smithery:uplink": "bash scripts/smithery-publish.sh --uplink-dev"
-  },
-  "keywords": [
-    "mcp",
-    "gateway",
-    "governance",
-    "chp",
-    "principal",
-    "sse",
-    "allowlist",
-    "vault"
-  ],
-  "author": "Shyam Desigan <sam@cubiczan.com>",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/icohangar-ops/governed-mcp-gateway.git"
-  },
-  "homepage": "https://github.com/icohangar-ops/governed-mcp-gateway#readme",
-  "bugs": {
-    "url": "https://github.com/icohangar-ops/governed-mcp-gateway/issues"
+    "test": "npm test --workspaces --if-present",
+    "gateway": "npm start -w @cubiczan/governed-mcp-gateway",
+    "spend": "npm start -w @cubiczan/spend-mandate-plane",
+    "cfo": "npm start -w @cubiczan/cfo-agent-mesh",
+    "shots": "node --import tsx scripts/capture-live.ts && python3 scripts/render-readme-shots.py"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
-  "devDependencies": {
-    "@types/node": "^22.15.0",
-    "tsx": "^4.19.3",
-    "typescript": "^5.8.0"
-  },
-  "publishConfig": {
-    "access": "public"
-  }
+  "license": "MIT"
 }

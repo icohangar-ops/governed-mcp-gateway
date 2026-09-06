@@ -1,0 +1,121 @@
+{
+  "gateway_call": {
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "result": {
+      "_meta": {
+        "cubiczan": {
+          "principal": {
+            "id": "agt_payops",
+            "kind": "agent",
+            "orgId": "org_acme",
+            "displayName": "PayOps Runner"
+          }
+        }
+      },
+      "structuredContent": {
+        "pong": true,
+        "echo": {
+          "hello": "world"
+        },
+        "principal": {
+          "id": "agt_payops",
+          "kind": "agent",
+          "orgId": "org_acme",
+          "displayName": "PayOps Runner"
+        }
+      }
+    }
+  },
+  "gateway_sse": "id: 1\nevent: message\ndata: {\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"notifications/message\",\n  \"params\": {\n    \"level\": \"info\",\n    \"message\": \"sse-open\",\n    \"_meta\": {\n      \"cubiczan\": {\n        \"principal\": {\n          \"id\": \"agt_payops\",\n          \"kind\": \"agent\",\n          \"orgId\": \"org_acme\",\n          \"displayName\": \"PayOps Runner\"\n        }\n      }\n    }\n  }\n}",
+  "gateway_rotate": {
+    "name": "github_token",
+    "version": 2,
+    "preview": "ghp_ne…bbbb",
+    "oldSecretValid": false,
+    "newSecretValid": true,
+    "inputIdUnchanged": true
+  },
+  "spend_auto": {
+    "id": "prp_51add684a47e6dc2",
+    "agent": "agt_payops",
+    "totalCents": 1200,
+    "currency": "USD",
+    "lane": "auto",
+    "chpState": "LOCKED",
+    "mandateId": "man_stripe_monthly",
+    "reasons": [
+      "Devil's advocate: no material objections at routine tier"
+    ]
+  },
+  "spend_countersign": {
+    "proposal": {
+      "id": "prp_7c05651dafff85c7",
+      "totalCents": 8000,
+      "lane": "approval",
+      "chpState": "PROVISIONAL"
+    },
+    "agentCountersign": {
+      "status": 400,
+      "error": "agent cannot countersign itself"
+    },
+    "humanCountersign": {
+      "id": "prp_7c05651dafff85c7",
+      "lane": "auto",
+      "chpState": "LOCKED",
+      "countersignedBy": "human.controller"
+    }
+  },
+  "spend_settle": {
+    "stripe": {
+      "rail": "stripe",
+      "reference": "evt_meter_prp_51add684a47e6dc2",
+      "at": "2026-08-21T15:19:35.309Z"
+    },
+    "x402": {
+      "rail": "x402",
+      "reference": "x402_payreq_prp_9f3cf1eacb4e9018",
+      "at": "2026-08-21T15:19:35.310Z"
+    }
+  },
+  "cfo_unsealed": {
+    "status": 400,
+    "error": "claim has no source documents"
+  },
+  "cfo_evidence": {
+    "ledgerOk": true,
+    "pack": {
+      "controlId": "ICFR-CFO-MESH-01",
+      "claimId": "clm_67b954c8db19a089",
+      "agentId": "agt_lease",
+      "lockState": "LOCKED",
+      "documents": [
+        {
+          "id": "doc_3d48579b46c7dd9f",
+          "name": "lease-register.csv",
+          "sha256": "9a7f4b19df9def67c0a3c9092a0f2a4f0b09e4e30951c1d88c73f0025bdb42bf"
+        }
+      ],
+      "tokenSources": 1,
+      "engines": 1
+    },
+    "sigPreview": "36a2de5b40665bf05d816b92…"
+  },
+  "cfo_lease": {
+    "leaseId": "L-1",
+    "classification": "finance",
+    "periods": 24,
+    "opening": {
+      "period": 1,
+      "payment": "1000.00",
+      "interest": "112.81",
+      "closingLiability": "21675.68"
+    },
+    "closing": {
+      "period": 24,
+      "payment": "1000.00",
+      "interest": "4.99",
+      "closingLiability": "0.00"
+    }
+  }
+}
