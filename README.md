@@ -1,86 +1,58 @@
-# @cubiczan/governed-mcp-gateway
+# Cubiczan Agent Platform
 
-[![npm](https://img.shields.io/npm/v/@cubiczan/governed-mcp-gateway)](https://www.npmjs.com/package/@cubiczan/governed-mcp-gateway)
-[![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.icohangar--ops%2Fgoverned--mcp--gateway-00C4B4)](https://registry.modelcontextprotocol.io)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+Identity, money, and evidence for agents that actually ship.
 
-HTTP MCP **control plane** (default port **7474**). Principal on every `tools/call` and every SSE frame — not a tool catalog.
+Three SKUs, one workspace. MCP clients keep a Bearer principal through `tools/call` and SSE. Spend cannot settle without a mandate and, over cap, a human second key. Board claims cannot seal without an agent, a CHP lock, and a hashed document.
 
-Production MCP auth often dies when work hops threads or workers. This gateway resolves a Bearer credential to a **Principal**, injects it into `params._meta.cubiczan.principal`, repeats it on SSE, enforces allowlists, rotates vaulted secrets in place, and runs a lightweight CHP spend gate before priced tools.
+![Three SKUs: governed MCP gateway, spend mandate plane, CFO agent mesh](docs/screenshots/architecture.png)
 
-## Install / run
+| SKU | Port | Repo | Job |
+|---|---|---|---|
+| [Governed MCP Gateway](packages/governed-mcp-gateway) | `:7474` | [icohangar-ops/governed-mcp-gateway](https://github.com/icohangar-ops/governed-mcp-gateway) | Fail-closed Bearer auth. Principal on every tool call and SSE frame. Signed authz decisions. Vaulted credential rotation. |
+| [Agent Spend & Mandate Plane](packages/spend-mandate-plane) | `:7475` | [icohangar-ops/spend-mandate-plane](https://github.com/icohangar-ops/spend-mandate-plane) | Propose → mandate → countersign → settle. Stripe by default; x402 is a rail. |
+| [Auditable CFO Agent Mesh](packages/cfo-agent-mesh) | `:7476` | [icohangar-ops/cfo-agent-mesh](https://github.com/icohangar-ops/cfo-agent-mesh) | Claim → agent → lock → document. ASC 842 / 606 / 718 engines. HMAC-chained evidence pack. |
 
-```bash
-npm i -g @cubiczan/governed-mcp-gateway   # or use npx
-npx -y @cubiczan/governed-mcp-gateway
-# → http://127.0.0.1:7474
-```
+Shared primitives (`packages/shared`): CHP gate, HMAC ledger, HTTP/SSE helpers. Zero runtime npm dependencies. Stripe and x402 are rails — tests never call live networks.
 
-From source:
+## Quickstart
 
 ```bash
 npm install
-npm run build
-npm start
 npm test
+npm run gateway   # :7474
+npm run spend     # :7475
+npm run cfo       # :7476
 ```
 
-## Cursor / Claude config
+Demo Bearer keys (also in `.env.example`):
 
-Start the gateway in a terminal (or a process manager), then point the client at the HTTP MCP endpoints:
+| Role | Key |
+|---|---|
+| Gateway agent | `mcp_agt_payops_demo` |
+| Gateway human | `mcp_human_controller_demo` |
+| Gateway research (no `stripe.charge`) | `mcp_agt_research_demo` |
+| Spend agent | `spend_agt_payops_demo` |
+| Spend human | `spend_human_controller_demo` |
+| CFO agent | `cfo_agt_lease_demo` |
+| CFO human | `cfo_human_controller_demo` |
 
-```json
-{
-  "mcpServers": {
-    "governed-gateway": {
-      "url": "http://127.0.0.1:7474/mcp",
-      "headers": {
-        "Authorization": "Bearer mcp_agt_payops_demo"
-      }
-    },
-    "chp": {
-      "command": "npx",
-      "args": ["-y", "@cubiczan/chp-mcp"]
-    },
-    "conductor": {
-      "command": "npx",
-      "args": ["-y", "@cubiczan/agent-conductor"]
-    }
-  }
-}
+Regenerate the README cards from live local APIs:
+
+```bash
+npm run shots
 ```
 
-Demo keys: `mcp_agt_payops_demo`, `mcp_agt_research_demo`, `mcp_human_controller_demo`.
+---
 
-## Stack
+## 1. Governed MCP Gateway
 
-```text
-┌─────────────────┐     ┌──────────────────────────┐     ┌────────────────────┐
-│ Cursor / Claude │────▶│ governed-mcp-gateway     │────▶│ spend-mandate-plane│
-│ (MCP client)    │ SSE │ :7474  principal+vault   │ opt │ :7475              │
-└────────┬────────┘     └────────────┬─────────────┘     └────────────────────┘
-         │                           │
-         │ stdio                     │ CHP gate (embedded)
-         ▼                           ▼
-┌─────────────────┐     ┌──────────────────────────┐
-│ @cubiczan/      │     │ @cubiczan/chp-mcp        │
-│ agent-conductor │     │ Profile B spend / HITL   │
-└─────────────────┘     └──────────────────────────┘
-```
+Production MCP drops identity. `listTools` runs on the request thread; `tools/call` and SSE run somewhere else. This gateway fail-closes on a bad Bearer, re-resolves the **Principal** on every `tools/list` and `tools/call` (no session JWT), injects principal + grants on `_meta`, and repeats identity on **every SSE frame**. Named vault inputs rotate in place — `github_token` stays `github_token`. Allowlist ∩ token scope is enforced twice; allow/deny is an HMAC-chained `authz.decision`.
 
-Sister packages: [@cubiczan/chp-mcp](https://github.com/icohangar-ops/cubiczan-chp-mcp), [@cubiczan/agent-conductor](https://github.com/icohangar-ops/agent-conductor), [consensus-hardening-protocol](https://github.com/icohangar-ops/consensus-hardening-protocol).
+![Principal injected on tools/call](docs/screenshots/gateway-principal.png)
 
-## API
+![SSE repeats principal on every frame](docs/screenshots/gateway-sse.png)
 
-| Method | Path | Auth | What |
-|--------|------|------|------|
-| `GET` | `/health` | — | `{ ok, service }` |
-| `POST` | `/mcp` | Bearer | JSON-RPC `initialize`, `tools/list`, `tools/call` |
-| `GET` | `/mcp/sse` | Bearer | SSE with principal on `_meta` |
-| `POST` | `/v1/credentials` | Human | Put a named secret |
-| `POST` | `/v1/credentials/:name/rotate` | Human | New hash, same name |
-| `POST` | `/v1/credentials/verify` | — | `{ ok }` |
-| `POST` | `/v1/locks` | Human | CHP approve / reject |
+![Rotate github_token without a new input id](docs/screenshots/gateway-rotate.png)
 
 ```bash
 curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
@@ -89,11 +61,69 @@ curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
   http://127.0.0.1:7474/mcp
 ```
 
-## Notes
+| Method | Path | What |
+|---|---|---|
+| `POST` | `/mcp` | JSON-RPC `initialize`, `tools/list`, `tools/call` |
+| `GET` | `/mcp/sse?once=1` | SSE notification with `_meta.cubiczan.principal` |
+| `POST` | `/v1/credentials/:name/rotate` | Human-only vault rotate; old hash dies |
+| `POST` | `/v1/credentials/verify` | Check a secret against the current hash |
 
-- This is an **HTTP** MCP gateway (JSON-RPC + SSE), not a stdio MCP process. The `governed-mcp-gateway` bin starts the HTTP server.
-- Shared CHP / HTTP / ledger helpers are **vendored** under `src/shared/` (no `@cubiczan/shared` workspace dep).
-- Optional: set `SPEND_PLANE_URL` to hook the spend-mandate plane before priced tools.
+---
+
+## 2. Agent Spend & Mandate Plane
+
+Agents propose. Mandates authorize. A human countersigns when the amount is over the auto cap. The proposing agent **cannot** countersign itself. Settlement is a rail: Stripe meter event by default, x402 payment-required if you ask for it. No chain calls in this MVP.
+
+![Under-cap proposal auto-locks](docs/screenshots/spend-auto.png)
+
+![Over-cap requires a human second key](docs/screenshots/spend-countersign.png)
+
+![Stripe meter vs x402 payment-required](docs/screenshots/spend-settle.png)
+
+```bash
+curl -sS -H "Authorization: Bearer spend_agt_payops_demo" \
+  -H "Content-Type: application/json" \
+  -d '{"agent":"agt_payops","merchant":{"name":"Stripe","url":"https://stripe.com","country":"US"},"total":"12.00","rationale":"tool meter"}' \
+  http://127.0.0.1:7475/v1/proposals
+```
+
+| Method | Path | What |
+|---|---|---|
+| `POST` | `/v1/mandates` | Operator creates remaining-cents coverage |
+| `POST` | `/v1/proposals` | Agent propose; lane `auto` \| `approval` \| `blocked` |
+| `POST` | `/v1/countersign` | Human second key; agents are rejected |
+| `POST` | `/v1/settle` | `{ "rail": "stripe" }` or `"x402"` |
+
+---
+
+## 3. Auditable CFO Agent Mesh
+
+A board claim is not done until it has an **agent**, a **LOCKED** CHP state, and at least one source document hash. Engines measure (ASC 842 lease rollforward, ASC 606 constrained POC, ASC 718 SBC). They do not decide facts of law. Token spend attaches as a source on the same HMAC-chained ledger.
+
+![Unsealed claim without documents](docs/screenshots/cfo-unsealed.png)
+
+![Sealed evidence pack](docs/screenshots/cfo-evidence.png)
+
+![ASC 842 finance lease ends at 0.00](docs/screenshots/cfo-lease.png)
+
+```bash
+curl -sS -H "Authorization: Bearer cfo_agt_lease_demo" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"AI spend is $12.00 this period","narrative":"Token ledger supports the board claim.","agentId":"agt_lease"}' \
+  http://127.0.0.1:7476/v1/claims
+```
+
+| Method | Path | What |
+|---|---|---|
+| `POST` | `/v1/claims` | Open a claim |
+| `POST` | `/v1/claims/:id/documents` | Attach a named source; SHA-256 stored |
+| `POST` | `/v1/claims/:id/lock` | Human lock → `LOCKED` |
+| `POST` | `/v1/engines/lease` | ASC 842 classification + rollforward |
+| `GET` | `/v1/evidence/:id` | Seal; `400` if no documents or not locked |
+
+## Specs
+
+OpenSpec change: [`openspec/changes/ship-three-sku-platform/`](openspec/changes/ship-three-sku-platform/).
 
 ## License
 
