@@ -1,0 +1,7 @@
+schema: spec-driven
+context: |
+  Tech stack: TypeScript, Node.js built-in http/test, no framework runtime.
+  Three SKUs in one workspace: governed MCP gateway, spend/mandate plane, CFO agent mesh.
+  Domain: CHP (Consensus Hardening Protocol) — R0 gate, adversary, human lock, sealed evidence.
+  Money: integer cents. Accounting engines round half-up to cents.
+  Do not commit secrets. Stripe and x402 are rails behind a Mandate interface.
