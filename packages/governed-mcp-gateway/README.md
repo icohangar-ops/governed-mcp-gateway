@@ -1,6 +1,6 @@
 # Governed MCP Gateway
 
-Port **7474**. Principal on every `tools/call` and every SSE frame.
+Port **7474**. Fail-closed Bearer auth. Principal re-resolved on every `tools/list` and `tools/call`, and repeated on every SSE frame. Schema token tax with pack / allow-by-need catalog.
 
 Production MCP is stuck on auth. `SecurityContextHolder` / ThreadLocal dies when the tool runs on an SSE worker. VS Code secrets are keyed by `inputs[].id`, so rotating a token by renaming the input leaves the old secret alive. This SKU is a **control plane**, not a server catalog.
 
@@ -8,11 +8,14 @@ Production MCP is stuck on auth. `SecurityContextHolder` / ThreadLocal dies when
 
 It:
 
-- Resolves a Bearer credential to a **Principal**
-- Injects that principal into `params._meta.cubiczan.principal` on every `tools/call`
-- Repeats the principal on **every SSE event** so identity cannot drop with the handshake
+- Resolves a Bearer credential to a **Principal** on every `tools/list` and `tools/call` (no JWT/Bearer stored on a session)
+- Denies missing, invalid, expired, wrong-audience, and wrong-scope tokens — never falls through to all-tools
+- Injects principal, allowed tools, and scopes into `params._meta.cubiczan` on every `tools/call`
+- Repeats that identity on **every SSE event** so identity cannot drop with the handshake
+- Filters `tools/list` by allowlist ∩ token scope and enforces the same intersection on `tools/call`
+- Appends a signed `authz.decision` (canonical JSON + HMAC, `prevSig` chain) for allow and deny
+- Binds CHP human locks to a tool + argument hash (changed arguments and replay are denied)
 - Rotates vaulted MCP inputs in place (`github_token` stays `github_token`; the old hash stops verifying)
-- Enforces per-principal tool allowlists
 - Measures `tools/list` schema **token tax** and exposes a **pack / allow-by-need** catalog instead of dumping every schema every turn
 - Optionally hooks the spend-mandate plane before a priced tool runs
 
@@ -78,9 +81,9 @@ curl -sS -H "Authorization: Bearer mcp_human_controller_demo" \
 | `POST` | `/v1/credentials/verify` | — | `{ ok: boolean }` |
 | `POST` | `/v1/locks` | Human | CHP approve / reject |
 
-Demo keys: `mcp_agt_payops_demo` (PayOps: `echo.ping`, `stripe.charge`), `mcp_agt_research_demo` (no charge tool), `mcp_human_controller_demo` (vault + locks).
+Demo keys: `mcp_agt_payops_demo` (PayOps: `echo.ping`, `stripe.charge`), `mcp_agt_research_demo` (no charge tool), `mcp_human_controller_demo` (vault + locks). Demo keys are opaque Bearers with implicit audience `mcp://governed-gateway` and scope `mcp.invoke`. Signed `czb1` claim tokens (HMAC, same ledger key) add `exp` / `aud` / `scope` for tests and adapters.
 
-Disallowed tools return JSON-RPC `-32001` — they do not run.
+Token defects return HTTP **401** `{ error, reason }` (`missing` | `invalid` | `expired` | `wrong_audience` | `wrong_scope`). Disallowed tools return JSON-RPC `-32001` — they do not run. Over-cap `stripe.charge` returns `-32004` with a `lockId`; changed arguments after approval are `-32006`, replay of a consumed lock is `-32007`.
 
 ## Schema token tax and pack / allow-by-need
 
@@ -132,10 +135,22 @@ curl -sS -H "Authorization: Bearer mcp_human_controller_demo" \
 
 [`test/fixtures/oversized-schema.json`](test/fixtures/oversized-schema.json) is a compact recipe. The gateway expands it into `docs.mega_schema` on server `synthetic.oversized` so the inspector can show a three-order-of-magnitude gap versus `echo.ping`. Thresholds (defaults): tool 512 tokens, pack 1024, listed payload 2048. Ledger events: `schema.tax.recorded`, `schema.pack.opened`, `schema.pack.denied`, `schema.pack.flagged`.
 
+
+## Threat model
+
+An allowlist is a catalog filter, not authorization. A principal may be allowed to *see* `stripe.charge` and still be denied if the Bearer grant does not include that tool or `mcp.invoke`. Confusing the two is how MCP servers fail open to all-tools after a partial auth check.
+
+ThreadLocal / `SecurityContextHolder` principals are unsafe on MCP. `tools/list` often runs on the request thread; `tools/call` and SSE writes run on another worker. Identity that is not on the request (and on `_meta` of that call or frame) is gone. This gateway never stores a JWT on a session object and never reads identity from a thread-local.
+
+Session reuse across users is unsafe. A long-lived SSE or JSON-RPC session that caches the first Bearer lets the next caller inherit that grant. Re-resolve from `Authorization` on every `tools/list` and `tools/call`. Two sequential calls with different keys on the same process must yield different principals.
+
+Human approval without an argument hash is a replay oracle: approve $50, submit $5,000. Locks are single-use and bound to `sha256(canonicalJson(arguments))`.
+
 ## Layout
 
 ```
-packages/governed-mcp-gateway/src/gateway.ts       HTTP + JSON-RPC + SSE + vault
+packages/governed-mcp-gateway/src/gateway.ts       HTTP + JSON-RPC + SSE + vault + locks
+packages/governed-mcp-gateway/src/auth.ts          Fail-closed Bearer + czb1 claims
 packages/governed-mcp-gateway/src/token-tax.ts     bytes→token heuristic + report types
 packages/governed-mcp-gateway/src/tool-catalog.ts  packs + oversized fixture expansion
 packages/governed-mcp-gateway/src/context-pack.ts  session packs, allow-by-need

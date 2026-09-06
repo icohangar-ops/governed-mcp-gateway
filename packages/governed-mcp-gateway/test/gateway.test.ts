@@ -29,6 +29,8 @@ test("missing credential is rejected", async () => {
   try {
     const res = await rpc(base, undefined, "tools/call", { name: "echo.ping" });
     assert.equal(res.status, 401);
+    assert.equal(res.json.reason, "missing");
+    assert.equal(res.json.result, undefined);
   } finally {
     server.close();
   }
@@ -43,6 +45,10 @@ test("tools/call injects principal", async () => {
     });
     assert.equal(res.status, 200);
     assert.equal(res.json.result._meta.cubiczan.principal.id, "agt_payops");
+    assert.deepEqual(res.json.result._meta.cubiczan.allowedTools, ["echo.ping", "stripe.charge"]);
+    assert.deepEqual(res.json.result._meta.cubiczan.scopes, ["mcp.invoke"]);
+    assert.equal(res.json.result._meta.cubiczan.token, undefined);
+    assert.equal(res.json.result._meta.cubiczan.jwt, undefined);
     const structured = res.json.result.structuredContent;
     assert.equal(structured.principal.id, "agt_payops");
   } finally {
@@ -244,4 +250,3 @@ test("context.inspect tool returns session tax for the caller", async () => {
     server.close();
   }
 });
-
