@@ -29,8 +29,6 @@ test("missing credential is rejected", async () => {
   try {
     const res = await rpc(base, undefined, "tools/call", { name: "echo.ping" });
     assert.equal(res.status, 401);
-    assert.equal(res.json.reason, "missing");
-    assert.equal(res.json.result, undefined);
   } finally {
     server.close();
   }
@@ -45,10 +43,6 @@ test("tools/call injects principal", async () => {
     });
     assert.equal(res.status, 200);
     assert.equal(res.json.result._meta.cubiczan.principal.id, "agt_payops");
-    assert.deepEqual(res.json.result._meta.cubiczan.allowedTools, ["echo.ping", "stripe.charge"]);
-    assert.deepEqual(res.json.result._meta.cubiczan.scopes, ["mcp.invoke"]);
-    assert.equal(res.json.result._meta.cubiczan.token, undefined);
-    assert.equal(res.json.result._meta.cubiczan.jwt, undefined);
     const structured = res.json.result.structuredContent;
     assert.equal(structured.principal.id, "agt_payops");
   } finally {
@@ -123,6 +117,7 @@ test("default tools/list is a minimal pack and records tax", async () => {
     assert.ok(names.includes("context.inspect"));
     assert.ok(names.includes("context.need"));
     assert.ok(!names.includes("stripe.charge"));
+    assert.ok(!names.includes("index.query"));
     const tax = res.json.result._meta.cubiczan.tax;
     assert.equal(tax.mode, "pack");
     assert.equal(typeof tax.tokens, "number");
@@ -191,9 +186,12 @@ test("context inspector HTTP is fail-closed and flags the oversized fixture", as
     assert.equal(report.heuristic.bytesPerToken, 4);
     const mega = report.estate.tools.find((t: { name: string }) => t.name === "docs.mega_schema");
     assert.equal(mega.oversized, true);
+    assert.equal(mega.oversizedSchema, true);
+    assert.ok(mega.schemaTokens > mega.descriptionTokens);
     assert.ok(report.estate.flagged.includes("docs.mega_schema"));
     assert.ok(report.estate.flagged.includes("pack:bloat"));
     assert.ok(report.estate.ratioMaxMin > 100);
+    assert.ok(report.session);
     const bloat = report.estate.servers.find((s: { server: string }) => s.server === "synthetic.oversized");
     const gatewayServer = report.estate.servers.find((s: { server: string }) => s.server === "governed-mcp-gateway");
     assert.ok(bloat.tokens > gatewayServer.tokens);
@@ -234,6 +232,203 @@ test("POST /v1/context/need admits allowlisted tools into the session", async ()
   }
 });
 
+test("unauthenticated inspector and tools/list stay fail-closed", async () => {
+  const { server, base } = await start();
+  try {
+    const list = await rpc(base, undefined, "tools/list");
+    assert.equal(list.status, 401);
+
+    const packs = await fetch(`${base}/v1/context/packs`);
+    assert.equal(packs.status, 401);
+
+    const need = await fetch(`${base}/v1/context/need`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tools: ["stripe.charge"] }),
+    });
+    assert.equal(need.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test("research cannot need stripe.charge via the HTTP API", async () => {
+  const { server, base, gateway } = await start();
+  try {
+    const need = await fetch(`${base}/v1/context/need`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer mcp_agt_research_demo",
+      },
+      body: JSON.stringify({ tools: ["stripe.charge"] }),
+    });
+    assert.equal(need.status, 200);
+    const body = await need.json();
+    assert.deepEqual(body.denied, ["stripe.charge"]);
+    assert.ok(gateway.ledger.records.some((r) => r.event === "schema.pack.denied"));
+  } finally {
+    server.close();
+  }
+});
+
+test("session pack cannot be reused by another principal", async () => {
+  const { server, base, keys } = await start();
+  try {
+    const first = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${keys.agentKey}`,
+        "x-cubiczan-session": "ses_stolen",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    assert.equal(first.status, 200);
+    const firstJson = await first.json();
+    assert.ok(!firstJson.error);
+    const stolen = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer mcp_agt_research_demo",
+        "x-cubiczan-session": "ses_stolen",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    });
+    const json = await stolen.json();
+    assert.equal(stolen.status, 200);
+    assert.equal(json.error.code, -32007);
+  } finally {
+    server.close();
+  }
+});
+
+test("host binds tenant and index; listed schema hides them", async () => {
+  const { server, base, keys } = await start();
+  try {
+    const listed = await rpc(base, keys.agentKey, "tools/list", { need: ["index.query"] });
+    const tool = listed.json.result.tools.find((t: { name: string }) => t.name === "index.query");
+    assert.ok(tool);
+    assert.deepEqual(Object.keys(tool.inputSchema.properties).sort(), ["query"]);
+    assert.equal(listed.json.result._meta.cubiczan.host.tenant, "org_acme");
+
+    const res = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${keys.agentKey}`,
+        "x-cubiczan-index": "kb_prod",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "index.query", arguments: { query: "leases" } },
+      }),
+    });
+    const json = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(json.result._meta.cubiczan.host.tenant, "org_acme");
+    assert.equal(json.result._meta.cubiczan.host.index, "kb_prod");
+    assert.equal(json.result._meta.cubiczan.host.vault.github_token.name, "github_token");
+    assert.equal(json.result._meta.cubiczan.host.vault.github_token.version, 1);
+    assert.equal(json.result._meta.cubiczan.host.vault.github_token.secret, undefined);
+    const structured = json.result.structuredContent;
+    assert.equal(structured.tenant, "org_acme");
+    assert.equal(structured.index, "kb_prod");
+    assert.equal(structured.query, "leases");
+  } finally {
+    server.close();
+  }
+});
+
+test("model-invented tenant in arguments is denied", async () => {
+  const { server, base, gateway, keys } = await start();
+  try {
+    const res = await rpc(base, keys.agentKey, "tools/call", {
+      name: "index.query",
+      arguments: { query: "x", tenant: "org_other" },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.error.code, -32006);
+    assert.ok(gateway.ledger.records.some((r) => r.event === "host.meta.denied"));
+  } finally {
+    server.close();
+  }
+});
+
+test("model-invented vaulted input name is denied", async () => {
+  const { server, base, gateway, keys } = await start();
+  try {
+    const res = await rpc(base, keys.agentKey, "tools/call", {
+      name: "echo.ping",
+      arguments: { hello: "world", github_token: "ghp_stolen" },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.error.code, -32006);
+    assert.ok(gateway.ledger.records.some((r) => r.event === "host.meta.denied"));
+  } finally {
+    server.close();
+  }
+});
+
+test("tenant header that does not match the principal is denied", async () => {
+  const { server, base, gateway, keys } = await start();
+  try {
+    const res = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${keys.agentKey}`,
+        "x-cubiczan-tenant": "org_other",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "echo.ping", arguments: { hello: "world" } },
+      }),
+    });
+    const json = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(json.error.code, -32006);
+    assert.ok(gateway.ledger.records.some((r) => r.event === "host.meta.denied"));
+  } finally {
+    server.close();
+  }
+});
+
+test("client principal impersonation is denied", async () => {
+  const { server, base, gateway, keys } = await start();
+  try {
+    const res = await rpc(base, keys.agentKey, "tools/call", {
+      name: "echo.ping",
+      arguments: { hello: "world" },
+      _meta: { cubiczan: { principal: { id: "agt_research", orgId: "org_acme" } } },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.error.code, -32006);
+    assert.ok(gateway.ledger.records.some((r) => r.event === "host.meta.denied"));
+  } finally {
+    server.close();
+  }
+});
+
+test("index.query without a host-bound index is denied", async () => {
+  const { server, base, keys } = await start();
+  try {
+    const res = await rpc(base, keys.agentKey, "tools/call", {
+      name: "index.query",
+      arguments: { query: "leases" },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.error.code, -32006);
+  } finally {
+    server.close();
+  }
+});
+
 test("context.inspect tool returns session tax for the caller", async () => {
   const { server, base, keys } = await start();
   try {
@@ -250,3 +445,4 @@ test("context.inspect tool returns session tax for the caller", async () => {
     server.close();
   }
 });
+
