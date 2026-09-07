@@ -10,6 +10,8 @@ export interface Principal {
   kind: "agent" | "human" | "service";
   orgId: string;
   displayName: string;
+  /** JWT `scope` values when the Bearer is a claim token. Absent for opaque API keys. */
+  scopes?: string[];
 }
 
 export interface R0 {
