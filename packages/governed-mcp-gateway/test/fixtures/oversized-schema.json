@@ -1,0 +1,11 @@
+{
+  "name": "docs.mega_schema",
+  "description": "Synthetic oversized MCP tool schema. Inspiration: measured tools/list cost can vary ~1700x across servers; this fixture makes that tax visible.",
+  "server": "synthetic.oversized",
+  "pack": "bloat",
+  "expansion": {
+    "propertyCount": 220,
+    "enumSize": 20,
+    "descriptionPad": 220
+  }
+}

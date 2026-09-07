@@ -108,3 +108,145 @@ test("disallowed tool does not run", async () => {
     server.close();
   }
 });
+
+function listedNames(json: { result?: { tools?: Array<{ name: string }> } }): string[] {
+  return (json.result?.tools ?? []).map((t) => t.name).sort();
+}
+
+test("default tools/list is a minimal pack and records tax", async () => {
+  const { server, base, gateway, keys } = await start();
+  try {
+    const res = await rpc(base, keys.agentKey, "tools/list");
+    assert.equal(res.status, 200);
+    const names = listedNames(res.json);
+    assert.ok(names.includes("echo.ping"));
+    assert.ok(names.includes("context.inspect"));
+    assert.ok(names.includes("context.need"));
+    assert.ok(!names.includes("stripe.charge"));
+    const tax = res.json.result._meta.cubiczan.tax;
+    assert.equal(tax.mode, "pack");
+    assert.equal(typeof tax.tokens, "number");
+    assert.equal(typeof tax.bytes, "number");
+    assert.ok(tax.savedTokens > 0);
+    assert.ok(gateway.ledger.records.some((r) => r.event === "schema.tax.recorded"));
+  } finally {
+    server.close();
+  }
+});
+
+test("PayOps can need the payments pack", async () => {
+  const { server, base, keys } = await start();
+  try {
+    const res = await rpc(base, keys.agentKey, "tools/list", { pack: "payments" });
+    assert.equal(res.status, 200);
+    const names = listedNames(res.json);
+    assert.ok(names.includes("stripe.charge"));
+    assert.ok(names.includes("echo.ping"));
+  } finally {
+    server.close();
+  }
+});
+
+test("research cannot need stripe.charge", async () => {
+  const { server, base, gateway } = await start();
+  try {
+    const res = await rpc(base, "mcp_agt_research_demo", "tools/list", {
+      need: ["stripe.charge"],
+    });
+    assert.equal(res.status, 200);
+    assert.ok(!listedNames(res.json).includes("stripe.charge"));
+    const denied = gateway.ledger.records.find((r) => r.event === "schema.pack.denied");
+    assert.ok(denied);
+    assert.deepEqual((denied.inputs as { denied: string[] }).denied, ["stripe.charge"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("mode=full lists the allowlist and still omits the estate fixture", async () => {
+  const { server, base, keys } = await start();
+  try {
+    const res = await rpc(base, keys.agentKey, "tools/list", { mode: "full" });
+    const names = listedNames(res.json);
+    assert.ok(names.includes("stripe.charge"));
+    assert.ok(!names.includes("docs.mega_schema"));
+    assert.equal(res.json.result._meta.cubiczan.tax.mode, "full");
+    assert.equal(res.json.result._meta.cubiczan.tax.savedTokens, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test("context inspector HTTP is fail-closed and flags the oversized fixture", async () => {
+  const { server, base, keys } = await start();
+  try {
+    const denied = await fetch(`${base}/v1/context/tax`);
+    assert.equal(denied.status, 401);
+
+    const res = await fetch(`${base}/v1/context/tax`, {
+      headers: { authorization: `Bearer ${keys.humanKey}` },
+    });
+    assert.equal(res.status, 200);
+    const report = await res.json();
+    assert.equal(report.heuristic.bytesPerToken, 4);
+    const mega = report.estate.tools.find((t: { name: string }) => t.name === "docs.mega_schema");
+    assert.equal(mega.oversized, true);
+    assert.ok(report.estate.flagged.includes("docs.mega_schema"));
+    assert.ok(report.estate.flagged.includes("pack:bloat"));
+    assert.ok(report.estate.ratioMaxMin > 100);
+    const bloat = report.estate.servers.find((s: { server: string }) => s.server === "synthetic.oversized");
+    const gatewayServer = report.estate.servers.find((s: { server: string }) => s.server === "governed-mcp-gateway");
+    assert.ok(bloat.tokens > gatewayServer.tokens);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /v1/context/need admits allowlisted tools into the session", async () => {
+  const { server, base, keys } = await start();
+  try {
+    const need = await fetch(`${base}/v1/context/need`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${keys.agentKey}`,
+        "x-cubiczan-session": "ses_payops_need",
+      },
+      body: JSON.stringify({ tools: ["stripe.charge"] }),
+    });
+    assert.equal(need.status, 200);
+    const body = await need.json();
+    assert.ok(body.admitted.includes("stripe.charge"));
+
+    const listed = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${keys.agentKey}`,
+        "x-cubiczan-session": "ses_payops_need",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    });
+    const json = await listed.json();
+    assert.ok(listedNames(json).includes("stripe.charge"));
+  } finally {
+    server.close();
+  }
+});
+
+test("context.inspect tool returns session tax for the caller", async () => {
+  const { server, base, keys } = await start();
+  try {
+    const res = await rpc(base, keys.agentKey, "tools/call", {
+      name: "context.inspect",
+      arguments: {},
+    });
+    assert.equal(res.status, 200);
+    const report = res.json.result.structuredContent;
+    assert.equal(report.session.principalId, "agt_payops");
+    assert.ok(report.estate.ratioMaxMin > 100);
+    assert.ok(!report.session.tools.includes("stripe.charge"));
+  } finally {
+    server.close();
+  }
+});

@@ -5,6 +5,7 @@ import {
   bearer,
   canonicalJson,
   createServer,
+  isoNow,
   newId,
   openSse,
   postJson,
@@ -25,6 +26,28 @@ import {
   type AuthDenyReason,
   type BearerClaims,
 } from "./auth.ts";
+import { ContextPackStore, resolveSessionId, type AdmitResult } from "./context-pack.ts";
+import {
+  DEFAULT_TAX_THRESHOLDS,
+  groupByServer,
+  maxMinRatio,
+  measureJson,
+  measureToolSchema,
+  packTax,
+  type ListTax,
+  type PackTax,
+  type ServerTax,
+  type TaxThresholds,
+  type ToolTax,
+} from "./token-tax.ts";
+import {
+  builtInCatalog,
+  canExpose,
+  isMetaTool,
+  toListedTool,
+  type CatalogTool,
+  type ToolImpl,
+} from "./tool-catalog.ts";
 
 export interface Credential {
   name: string;
@@ -60,6 +83,7 @@ export interface GatewayOptions {
   auditKey?: string;
   tokenKey?: string;
   audience?: string;
+  taxThresholds?: Partial<TaxThresholds>;
 }
 
 export type AuthOk = {
@@ -84,6 +108,33 @@ export interface CubiczanMeta {
   policyVersion: number;
 }
 
+export interface ContextTaxReport {
+  heuristic: { bytesPerToken: number };
+  thresholds: TaxThresholds;
+  generatedAt: string;
+  estate: {
+    servers: ServerTax[];
+    packs: PackTax[];
+    tools: ToolTax[];
+    ratioMaxMin: number;
+    ratioMaxMinTools: number;
+    flagged: string[];
+  };
+  session?: {
+    id: string;
+    principalId: string;
+    tools: string[];
+    taxes: ToolTax[];
+    tokens: number;
+    bytes: number;
+    fullAllowlistTokens: number;
+    savedTokens: number;
+    flagged: boolean;
+  };
+  sessions?: Array<{ id: string; principalId: string; tools: string[]; tokens: number }>;
+  recentLedger: Array<{ event: string; actor: string; inputs: unknown; ts: string }>;
+}
+
 function hash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -101,6 +152,16 @@ function asObject(value: Json | undefined): Record<string, Json> {
   return {};
 }
 
+function asStringArray(value: Json | undefined): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function headerSession(req: http.IncomingMessage): string {
+  const raw = req.headers["x-cubiczan-session"];
+  return typeof raw === "string" ? raw : Array.isArray(raw) ? (raw[0] ?? "") : "";
+}
+
 function rpcError(code: number, message: string, data?: unknown): Error {
   return Object.assign(new Error(message), { rpc: { code, message, data } });
 }
@@ -111,7 +172,10 @@ export class GovernedGateway {
   readonly agents = new Map<string, AgentRecord>();
   readonly keys = new Map<string, string>();
   readonly locks = new Map<string, PendingLock>();
-  readonly tools = new Map<string, (args: Record<string, Json>, principal: Principal) => Json>();
+  readonly catalog = new Map<string, CatalogTool>();
+  readonly tools = new Map<string, ToolImpl>();
+  readonly packs = new ContextPackStore();
+  readonly thresholds: TaxThresholds;
   readonly audience: string;
   readonly tokenKey: string;
   private seq = 0;
@@ -121,6 +185,9 @@ export class GovernedGateway {
     this.ledger = new AuditLedger(auditKey);
     this.tokenKey = options.tokenKey ?? auditKey;
     this.audience = options.audience ?? GATEWAY_AUDIENCE;
+    this.thresholds = { ...DEFAULT_TAX_THRESHOLDS, ...options.taxThresholds };
+    for (const def of builtInCatalog()) this.catalog.set(def.name, def);
+
     this.tools.set("echo.ping", (args, principal) => ({
       pong: true,
       echo: args,
@@ -136,6 +203,17 @@ export class GovernedGateway {
       query: args.query ?? "",
       principal,
     }));
+    this.tools.set("context.inspect", (args, principal) => this.inspectContext(principal, args));
+    this.tools.set("context.need", (args, principal) => this.needContext(principal, args) as unknown as Json);
+    this.tools.set("docs.mega_schema", (_args, principal) => {
+      const tax = this.toolTax("docs.mega_schema");
+      return { accepted: true, principal, tokens: tax?.tokens ?? 0, bytes: tax?.bytes ?? 0 };
+    });
+  }
+
+  registerTool(def: CatalogTool, impl: ToolImpl): void {
+    this.catalog.set(def.name, def);
+    this.tools.set(def.name, impl);
   }
 
   seedDemo(): { agentKey: string; humanKey: string } {
@@ -357,6 +435,251 @@ export class GovernedGateway {
     return { ...outcome, lockId, tool: lock.tool, argHash: lock.argHash, lockState: lock.state };
   }
 
+  sessionIdFor(principal: Principal, params: Record<string, Json>, req?: http.IncomingMessage): string {
+    const meta = asObject(asObject(params._meta).cubiczan);
+    return resolveSessionId(
+      principal.id,
+      typeof params.sessionId === "string" ? params.sessionId : undefined,
+      req ? headerSession(req) : "",
+      typeof meta.sessionId === "string" ? meta.sessionId : undefined,
+    );
+  }
+
+  allowlistOf(principal: Principal): string[] {
+    return this.agents.get(principal.id)?.allowlist ?? [];
+  }
+
+  toolTax(name: string): ToolTax | undefined {
+    const def = this.catalog.get(name);
+    if (!def) return undefined;
+    return measureToolSchema(def, this.thresholds.toolTokens);
+  }
+
+  estateTaxes(): ToolTax[] {
+    return [...this.catalog.values()].map((def) => measureToolSchema(def, this.thresholds.toolTokens));
+  }
+
+  estateReport(): ContextTaxReport["estate"] {
+    const tools = this.estateTaxes();
+    const servers = groupByServer(tools, this.thresholds.packTokens);
+    const byPack = new Map<string, ToolTax[]>();
+    for (const tool of tools) {
+      const list = byPack.get(tool.pack) ?? [];
+      list.push(tool);
+      byPack.set(tool.pack, list);
+    }
+    const packs = [...byPack.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([id, grouped]) => packTax(id, grouped, this.thresholds.packTokens));
+    const flagged = [
+      ...tools.filter((t) => t.oversized).map((t) => t.name),
+      ...packs.filter((p) => p.flagged).map((p) => `pack:${p.id}`),
+    ];
+    return {
+      servers,
+      packs,
+      tools,
+      ratioMaxMin: maxMinRatio(servers.map((s) => s.tokens)),
+      ratioMaxMinTools: maxMinRatio(tools.map((t) => t.tokens)),
+      flagged,
+    };
+  }
+
+  contextTaxReport(principal: Principal, sessionId?: string): ContextTaxReport {
+    const sid = sessionId ?? `ses_${principal.id}`;
+    const catalog = [...this.catalog.values()];
+    const session = this.packs.ensure(sid, principal.id, this.allowlistOf(principal), catalog);
+    const taxes = session.tools
+      .map((name) => this.toolTax(name))
+      .filter((tax): tax is ToolTax => Boolean(tax));
+    const bytes = taxes.reduce((n, t) => n + t.bytes, 0);
+    const tokens = taxes.reduce((n, t) => n + t.tokens, 0);
+    const fullAllowlistTokens = this.fullAllowlistTokens(principal);
+    const estate = this.estateReport();
+    const sessions =
+      principal.kind === "human"
+        ? [...this.packs.sessions.values()].map((s) => ({
+            id: s.id,
+            principalId: s.principalId,
+            tools: s.tools,
+            tokens: s.tools.reduce((n, name) => n + (this.toolTax(name)?.tokens ?? 0), 0),
+          }))
+        : undefined;
+    return {
+      heuristic: { bytesPerToken: 4 },
+      thresholds: this.thresholds,
+      generatedAt: isoNow(),
+      estate,
+      session: {
+        id: session.id,
+        principalId: session.principalId,
+        tools: session.tools,
+        taxes,
+        tokens,
+        bytes,
+        fullAllowlistTokens,
+        savedTokens: Math.max(0, fullAllowlistTokens - tokens),
+        flagged: tokens >= this.thresholds.packTokens || taxes.some((t) => t.oversized),
+      },
+      sessions,
+      recentLedger: this.ledger.records
+        .filter((r) => r.event.startsWith("schema."))
+        .slice(-20)
+        .map((r) => ({ event: r.event, actor: r.actor, inputs: r.inputs, ts: r.ts })),
+    };
+  }
+
+  fullAllowlistTokens(principal: Principal): number {
+    const names = new Set([...this.allowlistOf(principal), ...["context.inspect", "context.need"]]);
+    return [...names].reduce((n, name) => n + (this.toolTax(name)?.tokens ?? 0), 0);
+  }
+
+  admitNeed(
+    principal: Principal,
+    sessionId: string,
+    request: { tools?: string[]; pack?: string },
+  ): AdmitResult {
+    const result = this.packs.admit(
+      sessionId,
+      principal.id,
+      this.allowlistOf(principal),
+      [...this.catalog.values()],
+      request,
+    );
+    if (result.admitted.length > 0) {
+      this.ledger.append({
+        event: "schema.pack.opened",
+        actor: principal.id,
+        inputs: { sessionId, admitted: result.admitted, pack: request.pack ?? null },
+        sources: ["context-pack", "allowlist"],
+      });
+    }
+    if (result.denied.length > 0) {
+      this.ledger.append({
+        event: "schema.pack.denied",
+        actor: principal.id,
+        inputs: { sessionId, denied: result.denied, pack: request.pack ?? null },
+        sources: ["allowlist"],
+      });
+    }
+    return result;
+  }
+
+  listTools(
+    principal: Principal,
+    params: Record<string, Json>,
+    req?: http.IncomingMessage,
+    grants?: Omit<CubiczanMeta, "principal">,
+  ): {
+    tools: Array<{ name: string; description: string; inputSchema: Json }>;
+    _meta: {
+      cubiczan: {
+        principal: Principal;
+        sessionId: string;
+        tax: ListTax;
+        allowedTools?: string[];
+        scopes?: string[];
+        policyVersion?: number;
+      };
+    };
+  } {
+    const sessionId = this.sessionIdFor(principal, params, req);
+    const catalog = [...this.catalog.values()];
+    const allowlist = this.allowlistOf(principal);
+    const session = this.packs.ensure(sessionId, principal.id, allowlist, catalog);
+    const need = asStringArray(params.need);
+    const pack = typeof params.pack === "string" ? params.pack : undefined;
+    if (need.length > 0 || pack) this.admitNeed(principal, sessionId, { tools: need, pack });
+
+    const mode = params.mode === "full" ? "full" : "pack";
+    const names =
+      mode === "full"
+        ? [...new Set([...allowlist, "context.inspect", "context.need"])]
+        : session.tools.filter((name) => canExpose(name, allowlist));
+
+    const listed = names
+      .map((name) => this.catalog.get(name))
+      .filter((def): def is CatalogTool => Boolean(def))
+      .map(toListedTool);
+    const payload = measureJson(listed);
+    const fullAllowlistTokens = this.fullAllowlistTokens(principal);
+    const warnings: string[] = [];
+    const flagged = payload.tokens >= this.thresholds.listTokens;
+    if (flagged) warnings.push(`listed payload ${payload.tokens} tokens exceeds ${this.thresholds.listTokens}`);
+    for (const name of names) {
+      const tax = this.toolTax(name);
+      if (tax?.oversized) warnings.push(`tool ${name} is oversized (${tax.tokens} tokens)`);
+    }
+
+    const tax: ListTax = {
+      bytes: payload.bytes,
+      tokens: payload.tokens,
+      toolCount: listed.length,
+      fullAllowlistTokens,
+      savedTokens: mode === "full" ? 0 : Math.max(0, fullAllowlistTokens - payload.tokens),
+      flagged,
+      mode,
+      warnings,
+    };
+
+    this.ledger.append({
+      event: "schema.tax.recorded",
+      actor: principal.id,
+      inputs: { sessionId, mode, bytes: tax.bytes, tokens: tax.tokens, toolCount: tax.toolCount, flagged },
+      sources: ["tools/list", "token-tax"],
+    });
+    if (flagged || warnings.length > 0) {
+      this.ledger.append({
+        event: "schema.pack.flagged",
+        actor: principal.id,
+        inputs: { sessionId, mode, warnings },
+        sources: ["token-tax"],
+      });
+    }
+
+    return {
+      tools: listed,
+      _meta: {
+        cubiczan: {
+          principal,
+          sessionId,
+          tax,
+          ...(grants
+            ? {
+                allowedTools: grants.allowedTools,
+                scopes: grants.scopes,
+                policyVersion: grants.policyVersion,
+              }
+            : {}),
+        },
+      },
+    };
+  }
+
+  inspectContext(principal: Principal, args: Record<string, Json>): Json {
+    const sessionId =
+      typeof args.sessionId === "string" && args.sessionId
+        ? args.sessionId
+        : `ses_${principal.id}`;
+    const report = this.contextTaxReport(principal, sessionId);
+    if (args.includeEstate === false) {
+      const { estate: _estate, ...rest } = report;
+      return rest as unknown as Json;
+    }
+    return report as unknown as Json;
+  }
+
+  needContext(principal: Principal, args: Record<string, Json>): AdmitResult {
+    const sessionId =
+      typeof args.sessionId === "string" && args.sessionId
+        ? args.sessionId
+        : `ses_${principal.id}`;
+    return this.admitNeed(principal, sessionId, {
+      tools: asStringArray(args.tools),
+      pack: typeof args.pack === "string" ? args.pack : undefined,
+    });
+  }
+
   async dispatchTool(
     principal: Principal,
     name: string,
@@ -370,7 +693,7 @@ export class GovernedGateway {
     const allowedTools = grants?.allowedTools ?? intersectTools(agent.allowlist, agent.scopes);
     const scopes = grants?.scopes ?? agent.scopes;
 
-    if (!allowedTools.includes(name) || !agent.allowlist.includes(name)) {
+    if (!canExpose(name, agent.allowlist) || (!isMetaTool(name) && !allowedTools.includes(name))) {
       this.recordDecision({
         decision: "deny",
         tool: name,
@@ -381,7 +704,7 @@ export class GovernedGateway {
       });
       throw rpcError(-32001, `tool ${name} is not on the allowlist`);
     }
-    if (!intersectTools(agent.allowlist, scopes).includes(name)) {
+    if (!isMetaTool(name) && !intersectTools(agent.allowlist, scopes).includes(name)) {
       this.recordDecision({
         decision: "deny",
         tool: name,
@@ -543,6 +866,47 @@ export class GovernedGateway {
 
       const obj = asObject(body);
 
+      if (req.method === "GET" && url.pathname === "/v1/context/tax") {
+        const auth = this.authenticate(req);
+        if (!auth.ok) {
+          sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
+          return;
+        }
+        const sessionId = url.searchParams.get("session") ?? undefined;
+        sendJson(res, 200, this.contextTaxReport(auth.principal, sessionId));
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/context/packs") {
+        const auth = this.authenticate(req);
+        if (!auth.ok) {
+          sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
+          return;
+        }
+        const estate = this.estateReport();
+        sendJson(res, 200, {
+          heuristic: { bytesPerToken: 4 },
+          thresholds: this.thresholds,
+          packs: estate.packs,
+          servers: estate.servers,
+        });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/context/need") {
+        const auth = this.authenticate(req);
+        if (!auth.ok) {
+          sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
+          return;
+        }
+        const sessionId = this.sessionIdFor(auth.principal, obj, req);
+        sendJson(res, 200, this.admitNeed(auth.principal, sessionId, {
+          tools: asStringArray(obj.tools),
+          pack: typeof obj.pack === "string" ? obj.pack : undefined,
+        }));
+        return;
+      }
+
       if (req.method === "POST" && url.pathname === "/v1/credentials") {
         const auth = this.authenticate(req);
         if (!auth.ok || auth.principal.kind === "agent") {
@@ -626,17 +990,11 @@ export class GovernedGateway {
             sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
             return;
           }
-          const allowedTools = this.grantsFor(auth).allowedTools;
+          const grants = this.grantsFor(auth);
           sendJson(res, 200, {
             jsonrpc: "2.0",
             id,
-            result: {
-              tools: allowedTools.map((name) => ({
-                name,
-                description: `Governed tool ${name}`,
-                inputSchema: { type: "object" },
-              })),
-            },
+            result: this.listTools(auth.principal, asObject(obj.params), req, grants),
           });
           return;
         }
@@ -644,7 +1002,7 @@ export class GovernedGateway {
         if (method === "tools/call") {
           const previewParams = asObject(obj.params);
           const name = String(previewParams.name ?? "");
-          const auth = this.authenticate(req, name || undefined);
+          const auth = this.authenticate(req, isMetaTool(name) ? undefined : name || undefined);
           if (!auth.ok) {
             this.recordDecision({
               decision: "deny",

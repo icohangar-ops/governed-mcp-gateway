@@ -91,7 +91,7 @@ test("wrong-scope token cannot call an allowlisted tool", async () => {
     const listed = await rpc(base, token, "tools/list");
     assert.equal(listed.status, 200);
     const names = listed.json.result.tools.map((t: { name: string }) => t.name);
-    assert.deepEqual(names, ["echo.ping"]);
+    assert.ok(names.includes("echo.ping"));
     assert.ok(!names.includes("stripe.charge"));
 
     const res = await rpc(base, token, "tools/call", {
@@ -115,10 +115,18 @@ test("wrong-scope token cannot call an allowlisted tool", async () => {
 test("tools/list is filtered by principal allowlist", async () => {
   const { server, base } = await start();
   try {
-    const res = await rpc(base, "mcp_agt_research_demo", "tools/list");
+    const packed = await rpc(base, "mcp_agt_research_demo", "tools/list");
+    assert.equal(packed.status, 200);
+    const packNames = packed.json.result.tools.map((t: { name: string }) => t.name);
+    assert.ok(packNames.includes("echo.ping"));
+    assert.ok(!packNames.includes("stripe.charge"));
+    assert.ok(!packNames.includes("search.web"));
+
+    const res = await rpc(base, "mcp_agt_research_demo", "tools/list", { mode: "full" });
     assert.equal(res.status, 200);
     const names = res.json.result.tools.map((t: { name: string }) => t.name);
-    assert.deepEqual(names, ["echo.ping", "search.web"]);
+    assert.ok(names.includes("echo.ping"));
+    assert.ok(names.includes("search.web"));
     assert.ok(!names.includes("stripe.charge"));
   } finally {
     server.close();
@@ -140,7 +148,13 @@ test("empty allowlist does not fall through to all tools", async () => {
   try {
     const listed = await rpc(base, "mcp_agt_empty_demo", "tools/list");
     assert.equal(listed.status, 200);
-    assert.deepEqual(listed.json.result.tools, []);
+    const emptyNames = listed.json.result.tools.map((t: { name: string }) => t.name).sort();
+    assert.deepEqual(emptyNames, ["context.inspect", "context.need"]);
+    const full = await rpc(base, "mcp_agt_empty_demo", "tools/list", { mode: "full" });
+    const fullNames = full.json.result.tools.map((t: { name: string }) => t.name).sort();
+    assert.deepEqual(fullNames, ["context.inspect", "context.need"]);
+    assert.ok(!fullNames.includes("echo.ping"));
+    assert.ok(!fullNames.includes("stripe.charge"));
     const called = await rpc(base, "mcp_agt_empty_demo", "tools/call", { name: "echo.ping" });
     assert.equal(called.status, 200);
     assert.equal(called.json.error.code, -32001);
