@@ -179,6 +179,22 @@ Or point `command` at `npx.cmd` with `"shell": true` if the JetBrains schema all
 
 ---
 
+## 8. Spring AI MCP MVC Streamable HTTP + Kubernetes replicas
+
+Question: [79962720](https://stackoverflow.com/questions/79962720/spring-ai-mcp-mvc-1-1-2-with-streamable-http-on-kubernetes-how-to-handle-mcp)
+
+`Mcp-Session-Id` is a **process-local** map in typical Streamable HTTP servers (Spring AI MVC included). Replica A mints `abc123`; the Service load-balances `tools/call` to replica B; B has no session. Sticky ingress hides that until a rolling deploy or scale-in kills the pod.
+
+Three production options (pick one; do not rely on accidental in-process affinity):
+
+1. **STATELESS** (preferred when the tool only needs the authenticated principal). Do not mint `Mcp-Session-Id`. Spring: `spring.ai.mcp.server.protocol=STATELESS`. Cubiczan gateway: `MCP_SESSION_MODE=stateless` (default). Stamp the principal on every RPC / SSE frame — ThreadLocal will not survive the next replica.
+2. **Externalize** the session (`SessionStore` / Redis). Any replica can serve the next call. Unknown ids must **fail closed** (`UNKNOWN_SESSION`), not return an empty 200.
+3. **Sticky ingress** (cookie or hash of `Mcp-Session-Id`). Acceptable for short demos. Not acceptable as HA: deploys and scale-in produce `SESSION_STICKY_MISMATCH`. Clients must `initialize` again.
+
+Cubiczan runbook with Kubernetes snippets and curl proofs: [`docs/streamable-http-multi-replica.md`](../streamable-http-multi-replica.md). This repo does not post the answer to Stack Overflow.
+
+---
+
 ## Posting
 
 These cannot be posted with the Stack Apps key alone. To publish: open each link, paste the corresponding section, or run Stack Exchange OAuth and `POST /2.3/questions/{id}/answers/add` with `access_token` + `key` + `preview=false`.

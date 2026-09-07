@@ -25,11 +25,17 @@ export async function readJson(req: http.IncomingMessage): Promise<Json | undefi
   return JSON.parse(raw) as Json;
 }
 
-export function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
+export function sendJson(
+  res: http.ServerResponse,
+  status: number,
+  body: unknown,
+  headers?: http.OutgoingHttpHeaders,
+): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(payload),
+    ...headers,
   });
   res.end(payload);
 }
