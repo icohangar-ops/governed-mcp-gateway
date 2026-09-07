@@ -9,6 +9,4 @@ const gateway = new GovernedGateway({
 });
 gateway.seedDemo();
 const port = Number(process.env.PORT ?? 7474);
-const server = gateway.createHttpServer();
-await listen(server, port);
-console.log(`governed-mcp-gateway listening on http://127.0.0.1:${port}`);
+listen(gateway.createHttpServer(), port, "governed-mcp-gateway");
