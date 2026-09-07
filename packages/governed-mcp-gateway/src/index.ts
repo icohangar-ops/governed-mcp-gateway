@@ -1,4 +1,11 @@
 export { GovernedGateway, type ContextTaxReport, type GatewayOptions } from "./gateway.ts";
+export {
+  effectiveAllowlist,
+  intersectAllowlist,
+  loadClaimAllowlistFixture,
+  mintFixtureJwt,
+  toolsForScopes,
+} from "./claim-allowlist.ts";
 export { ContextPackStore, resolveSessionId } from "./context-pack.ts";
 export {
   HOST_ONLY_ARGUMENT_KEYS,

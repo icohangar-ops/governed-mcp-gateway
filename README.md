@@ -8,7 +8,7 @@ Three SKUs, one workspace. MCP clients keep a Bearer principal through `tools/ca
 
 | SKU | Port | Repo | Job |
 |---|---|---|---|
-| [Governed MCP Gateway](packages/governed-mcp-gateway) | `:7474` | [icohangar-ops/governed-mcp-gateway](https://github.com/icohangar-ops/governed-mcp-gateway) | Principal on every tool call and SSE frame. Host-injected `_meta` (tenant / index / vault). Vaulted credential rotation. Tool allowlists. Schema token-tax ledger and pack / allow-by-need `tools/list`. |
+| [Governed MCP Gateway](packages/governed-mcp-gateway) | `:7474` | [icohangar-ops/governed-mcp-gateway](https://github.com/icohangar-ops/governed-mcp-gateway) | Principal on every tool call and SSE frame. Claim→allowlist ∩ scope. Host-injected `_meta` (tenant / index / vault). Vaulted credential rotation. Schema token-tax ledger and pack / allow-by-need `tools/list`. |
 | [Agent Spend & Mandate Plane](packages/spend-mandate-plane) | `:7475` | [icohangar-ops/spend-mandate-plane](https://github.com/icohangar-ops/spend-mandate-plane) | Propose → mandate → countersign → settle. Stripe by default; x402 is a rail. |
 | [Auditable CFO Agent Mesh](packages/cfo-agent-mesh) | `:7476` | [icohangar-ops/cfo-agent-mesh](https://github.com/icohangar-ops/cfo-agent-mesh) | Claim → agent → lock → document. ASC 842 / 606 / 718 engines. HMAC-chained evidence pack. |
 
@@ -46,7 +46,7 @@ npm run shots
 
 ## 1. Governed MCP Gateway
 
-Production MCP drops identity. `listTools` runs on the request thread; `tools/call` and SSE run somewhere else. This gateway resolves a Bearer credential to a **Principal**, injects it on every JSON-RPC call, and repeats it on **every SSE frame**. Host-only tenant, index, and vaulted input names are bound on `_meta.cubiczan.host` — the model cannot invent them. Named vault inputs rotate in place — `github_token` stays `github_token`. Default `tools/list` is a session pack, not the full allowlist.
+Production MCP drops identity. `listTools` runs on the request thread; `tools/call` and SSE run somewhere else. This gateway resolves a Bearer credential to a **Principal**, injects it on every JSON-RPC call, and repeats it on **every SSE frame**. Host-only tenant, index, and vaulted input names are bound on `_meta.cubiczan.host` — the model cannot invent them. Named vault inputs rotate in place — `github_token` stays `github_token`. Default `tools/list` is a session pack, not the full allowlist. Language-agnostic recipe: [Principal-on-RPC cookbook](docs/principal-on-rpc.md) ([Spring](docs/recipes/spring-ai.md), [Ballerina](docs/recipes/ballerina.md), [Python FastAPI](docs/recipes/python-fastapi.md)). Host-injected `_meta` / pack-by-need: [`host-injected-meta`](openspec/changes/host-injected-meta/).
 
 ![Principal injected on tools/call](docs/screenshots/gateway-principal.png)
 
@@ -125,7 +125,7 @@ curl -sS -H "Authorization: Bearer cfo_agt_lease_demo" \
 
 ## Specs
 
-OpenSpec changes: [`ship-three-sku-platform`](openspec/changes/ship-three-sku-platform/), [`tools-list-token-tax`](openspec/changes/tools-list-token-tax/), [`host-injected-meta`](openspec/changes/host-injected-meta/).
+OpenSpec changes: [`ship-three-sku-platform`](openspec/changes/ship-three-sku-platform/), [`tools-list-token-tax`](openspec/changes/tools-list-token-tax/), [`principal-on-rpc-cookbook`](openspec/changes/principal-on-rpc-cookbook/), [`host-injected-meta`](openspec/changes/host-injected-meta/).
 
 ## License
 

@@ -1,0 +1,52 @@
+{
+  "audience": "mcp://governed-gateway",
+  "issuer": "https://issuer.cubiczan.test",
+  "hmacSecret": "gateway-jwt-demo-hmac",
+  "algorithm": "HS256",
+  "mappings": [
+    { "scope": "tools:echo", "tools": ["echo.ping"] },
+    { "scope": "tools:payments", "tools": ["stripe.charge"] },
+    { "scope": "tools:search", "tools": ["search.web"] }
+  ],
+  "cases": {
+    "validPayops": {
+      "sub": "agt_payops",
+      "scope": "tools:echo tools:payments",
+      "expOffsetSec": 3600
+    },
+    "echoOnly": {
+      "sub": "agt_payops",
+      "scope": "tools:echo",
+      "expOffsetSec": 3600
+    },
+    "expired": {
+      "sub": "agt_payops",
+      "scope": "tools:echo",
+      "expOffsetSec": -60
+    },
+    "wrongAud": {
+      "sub": "agt_payops",
+      "aud": "mcp://other-gateway",
+      "scope": "tools:echo",
+      "expOffsetSec": 3600
+    },
+    "guessedTool": {
+      "sub": "agt_payops",
+      "scope": "tools:echo",
+      "expOffsetSec": 3600,
+      "call": "vault.exfil"
+    },
+    "intersectDeny": {
+      "sub": "agt_payops",
+      "scope": "tools:echo",
+      "expOffsetSec": 3600,
+      "call": "stripe.charge"
+    },
+    "intersectAllow": {
+      "sub": "agt_payops",
+      "scope": "tools:echo tools:payments",
+      "expOffsetSec": 3600,
+      "call": "echo.ping"
+    }
+  }
+}

@@ -12,6 +12,15 @@ export {
   type Json,
 } from "./http.ts";
 export {
+  looksLikeJwt,
+  parseScopeClaim,
+  signHs256Jwt,
+  verifyHs256Jwt,
+  type JwtClaims,
+  type JwtFailReason,
+  type JwtVerifyOptions,
+} from "./jwt.ts";
+export {
   canonicalJson,
   cents,
   hmacHex,

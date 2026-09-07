@@ -14,6 +14,14 @@ import {
 } from "@cubiczan/shared";
 import type http from "node:http";
 import type { Json } from "@cubiczan/shared";
+import {
+  effectiveAllowlist,
+  loadClaimAllowlistFixture,
+  principalFromJwtClaims,
+  verifyFixtureJwt,
+  type BearerAuthResult,
+  type ClaimAllowlistFixture,
+} from "./claim-allowlist.ts";
 import { ContextPackStore, resolveSessionId, type AdmitResult } from "./context-pack.ts";
 import {
   bindHostBindings,
@@ -65,6 +73,8 @@ export interface GatewayOptions {
   spendPlaneUrl?: string;
   auditKey?: string;
   taxThresholds?: Partial<TaxThresholds>;
+  jwtNow?: () => number;
+  claimFixture?: ClaimAllowlistFixture;
 }
 
 export interface ContextTaxReport {
@@ -126,11 +136,13 @@ export class GovernedGateway {
   readonly tools = new Map<string, ToolImpl>();
   readonly packs = new ContextPackStore();
   readonly thresholds: TaxThresholds;
+  readonly claims: ClaimAllowlistFixture;
   private seq = 0;
 
   constructor(private readonly options: GatewayOptions = {}) {
     this.ledger = new AuditLedger(options.auditKey ?? "gateway-demo-key");
     this.thresholds = { ...DEFAULT_TAX_THRESHOLDS, ...options.taxThresholds };
+    this.claims = options.claimFixture ?? loadClaimAllowlistFixture();
     for (const def of builtInCatalog()) this.catalog.set(def.name, def);
 
     this.tools.set("echo.ping", (args, principal, host) => ({
@@ -266,12 +278,35 @@ export class GovernedGateway {
     return Boolean(cred && cred.hash === hash(secret));
   }
 
-  resolvePrincipal(req: http.IncomingMessage): Principal | undefined {
+  authenticate(req: http.IncomingMessage): BearerAuthResult {
     const token = bearer(req);
-    if (!token) return undefined;
+    if (!token) return { ok: false, reason: "missing" };
+
     const id = this.keys.get(hash(token));
-    if (!id) return undefined;
-    return this.agents.get(id)?.principal;
+    if (id) {
+      const agent = this.agents.get(id);
+      if (!agent) return { ok: false, reason: "invalid" };
+      return { ok: true, principal: { ...agent.principal }, source: "api-key" };
+    }
+
+    const verified = verifyFixtureJwt(token, this.claims, this.options.jwtNow);
+    if (!verified.ok) return { ok: false, reason: verified.reason };
+    const agent = this.agents.get(verified.claims.sub);
+    if (!agent) return { ok: false, reason: "invalid" };
+    return {
+      ok: true,
+      principal: principalFromJwtClaims(agent.principal, verified.claims),
+      source: "jwt",
+    };
+  }
+
+  resolvePrincipal(req: http.IncomingMessage): Principal | undefined {
+    const result = this.authenticate(req);
+    return result.ok ? result.principal : undefined;
+  }
+
+  denyBearer(res: http.ServerResponse, reason: string): void {
+    sendJson(res, 401, { error: "unauthorized", reason });
   }
 
   attachPrincipal(
@@ -282,11 +317,24 @@ export class GovernedGateway {
     const params = asObject(payload.params);
     const meta = asObject(params._meta);
     const cubiczan = asObject(meta.cubiczan);
+    const scopes = (principal.scopes ?? []) as unknown as Json;
     cubiczan.principal = principal as unknown as Json;
+    cubiczan.scopes = scopes;
     if (host) cubiczan.host = host as unknown as Json;
     meta.cubiczan = cubiczan;
+    meta.principal = principal as unknown as Json;
+    meta.scopes = scopes;
     params._meta = meta;
     return { ...payload, params };
+  }
+
+  metaFor(principal: Principal, extra: Record<string, Json> = {}): Record<string, Json> {
+    const scopes = (principal.scopes ?? []) as unknown as Json;
+    return {
+      principal: principal as unknown as Json,
+      scopes,
+      cubiczan: { principal: principal as unknown as Json, scopes, ...extra },
+    };
   }
 
   sessionIdFor(principal: Principal, params: Record<string, Json>, req?: http.IncomingMessage): string {
@@ -350,6 +398,10 @@ export class GovernedGateway {
     return this.agents.get(principal.id)?.allowlist ?? [];
   }
 
+  grantedTools(principal: Principal): string[] {
+    return effectiveAllowlist(this.allowlistOf(principal), principal, this.claims.mappings);
+  }
+
   toolTax(name: string): ToolTax | undefined {
     const def = this.catalog.get(name);
     if (!def) return undefined;
@@ -393,7 +445,7 @@ export class GovernedGateway {
   contextTaxReport(principal: Principal, sessionId?: string): ContextTaxReport {
     const sid = sessionId ?? `ses_${principal.id}`;
     const catalog = [...this.catalog.values()];
-    const session = this.packs.ensure(sid, principal.id, this.allowlistOf(principal), catalog);
+    const session = this.packs.ensure(sid, principal.id, this.grantedTools(principal), catalog);
     const taxes = session.tools
       .map((name) => this.toolTax(name))
       .filter((tax): tax is ToolTax => Boolean(tax));
@@ -447,7 +499,7 @@ export class GovernedGateway {
     const result = this.packs.admit(
       sessionId,
       principal.id,
-      this.allowlistOf(principal),
+      this.grantedTools(principal),
       [...this.catalog.values()],
       request,
     );
@@ -472,17 +524,17 @@ export class GovernedGateway {
 
   listTools(principal: Principal, params: Record<string, Json>, req?: http.IncomingMessage): {
     tools: Array<{ name: string; description: string; inputSchema: Json }>;
-    _meta: { cubiczan: { principal: Principal; sessionId: string; tax: ListTax; host: HostBindings } };
+    _meta: Record<string, Json>;
   } {
     const sessionId = this.sessionIdFor(principal, params, req);
     const catalog = [...this.catalog.values()];
-    const session = this.packs.ensure(sessionId, principal.id, this.allowlistOf(principal), catalog);
+    const session = this.packs.ensure(sessionId, principal.id, this.grantedTools(principal), catalog);
     const need = asStringArray(params.need);
     const pack = typeof params.pack === "string" ? params.pack : undefined;
     if (need.length > 0 || pack) this.admitNeed(principal, sessionId, { tools: need, pack });
 
     const mode = params.mode === "full" ? "full" : "pack";
-    const allowlist = this.allowlistOf(principal);
+    const allowlist = this.grantedTools(principal);
     const names =
       mode === "full"
         ? [...new Set([...allowlist, "context.inspect", "context.need"])]
@@ -533,7 +585,11 @@ export class GovernedGateway {
 
     return {
       tools: listed,
-      _meta: { cubiczan: { principal, sessionId, tax, host: hostBound.host } },
+      _meta: this.metaFor(principal, {
+        sessionId,
+        tax: tax as unknown as Json,
+        host: hostBound.host as unknown as Json,
+      }),
     };
   }
 
@@ -569,7 +625,7 @@ export class GovernedGateway {
   ): Promise<Json> {
     const agent = this.agents.get(principal.id);
     if (!agent) throw new Error("unknown principal");
-    if (!canExpose(name, agent.allowlist)) {
+    if (!canExpose(name, this.grantedTools(principal))) {
       const error = { code: -32001, message: `tool ${name} is not on the allowlist` };
       this.ledger.append({
         event: "tool.denied",
@@ -663,11 +719,12 @@ export class GovernedGateway {
       }
 
       if (req.method === "GET" && url.pathname === "/mcp/sse") {
-        const principal = this.resolvePrincipal(req);
-        if (!principal) {
-          sendJson(res, 401, { error: "unauthorized" });
+        const auth = this.authenticate(req);
+        if (!auth.ok) {
+          this.denyBearer(res, auth.reason);
           return;
         }
+        const principal = auth.principal;
         const sse = openSse(res);
         this.seq += 1;
         const frame = {
@@ -676,7 +733,7 @@ export class GovernedGateway {
           params: {
             level: "info",
             message: "sse-open",
-            _meta: { cubiczan: { principal } },
+            _meta: this.metaFor(principal),
           },
         };
         sse.send("message", frame, String(this.seq));
@@ -687,11 +744,12 @@ export class GovernedGateway {
       const obj = asObject(body);
 
       if (req.method === "GET" && url.pathname === "/v1/context/tax") {
-        const principal = this.resolvePrincipal(req);
-        if (!principal) {
-          sendJson(res, 401, { error: "unauthorized" });
+        const auth = this.authenticate(req);
+        if (!auth.ok) {
+          this.denyBearer(res, auth.reason);
           return;
         }
+        const principal = auth.principal;
         const sessionId = url.searchParams.get("session") ?? undefined;
         try {
           sendJson(res, 200, this.contextTaxReport(principal, sessionId));
@@ -705,11 +763,12 @@ export class GovernedGateway {
       }
 
       if (req.method === "GET" && url.pathname === "/v1/context/packs") {
-        const principal = this.resolvePrincipal(req);
-        if (!principal) {
-          sendJson(res, 401, { error: "unauthorized" });
+        const auth = this.authenticate(req);
+        if (!auth.ok) {
+          this.denyBearer(res, auth.reason);
           return;
         }
+        const principal = auth.principal;
         const estate = this.estateReport();
         sendJson(res, 200, {
           heuristic: { bytesPerToken: 4 },
@@ -721,11 +780,12 @@ export class GovernedGateway {
       }
 
       if (req.method === "POST" && url.pathname === "/v1/context/need") {
-        const principal = this.resolvePrincipal(req);
-        if (!principal) {
-          sendJson(res, 401, { error: "unauthorized" });
+        const auth = this.authenticate(req);
+        if (!auth.ok) {
+          this.denyBearer(res, auth.reason);
           return;
         }
+        const principal = auth.principal;
         const sessionId = this.sessionIdFor(principal, obj, req);
         try {
           sendJson(res, 200, this.admitNeed(principal, sessionId, {
@@ -781,11 +841,12 @@ export class GovernedGateway {
       }
 
       if (req.method === "POST" && (url.pathname === "/mcp" || url.pathname === "/")) {
-        const principal = this.resolvePrincipal(req);
-        if (!principal) {
-          sendJson(res, 401, { error: "unauthorized" });
+        const auth = this.authenticate(req);
+        if (!auth.ok) {
+          this.denyBearer(res, auth.reason);
           return;
         }
+        const principal = auth.principal;
         const method = String(obj.method ?? "");
         const id = obj.id ?? null;
         if (method === "initialize") {
@@ -864,7 +925,7 @@ export class GovernedGateway {
               id,
               result: {
                 content: [{ type: "text", text: JSON.stringify(result) }],
-                _meta: { cubiczan: { principal, host: hostBound.host } },
+                _meta: this.metaFor(principal, { host: hostBound.host as unknown as Json }),
                 structuredContent: result,
               },
             });

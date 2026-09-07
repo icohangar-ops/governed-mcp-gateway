@@ -4,14 +4,17 @@ Port **7474**. Principal on every `tools/call` and every SSE frame.
 
 Production MCP is stuck on auth. `SecurityContextHolder` / ThreadLocal dies when the tool runs on an SSE worker. VS Code secrets are keyed by `inputs[].id`, so rotating a token by renaming the input leaves the old secret alive. This SKU is a **control plane**, not a server catalog.
 
+**Cookbook:** resolve Bearer at HTTP → stamp `params._meta.principal` (and scopes) → filter `tools/list` by claim→allowlist → re-check on `tools/call` → repeat principal on every SSE frame. Never ThreadLocal. Host binds tenant / index / vault on `_meta.cubiczan.host`. Full write-up: [Principal-on-RPC](../../docs/principal-on-rpc.md). Host-injected `_meta` / pack-by-need: [`host-injected-meta`](../../openspec/changes/host-injected-meta/). Parity notes: [Spring AI](../../docs/recipes/spring-ai.md), [Ballerina](../../docs/recipes/ballerina.md), [Python FastAPI](../../docs/recipes/python-fastapi.md).
+
 ![Platform: gateway sits in front of spend and CFO mesh](docs/screenshots/architecture.png)
 
 It:
 
-- Resolves a Bearer credential to a **Principal**
-- Injects that principal into `params._meta.cubiczan.principal` on every `tools/call`
+- Resolves a Bearer credential to a **Principal** (opaque API key or HS256 JWT)
+- Injects that principal into `params._meta.principal` / `params._meta.cubiczan.principal` on every `tools/call`
 - Binds **host-only** tenant / index / vaulted input names onto `_meta.cubiczan.host` — the model does not choose them
 - Repeats the principal on **every SSE event** so identity cannot drop with the handshake
+- Maps JWT `scope` → tools; effective catalog is **allowlist ∩ scope** (fail-closed)
 - Rotates vaulted MCP inputs in place (`github_token` stays `github_token`; the old hash stops verifying)
 - Enforces per-principal tool allowlists
 - Measures `tools/list` schema **token tax** (description vs `inputSchema`) and exposes a **pack / allow-by-need** catalog instead of dumping every schema every turn
@@ -251,15 +254,22 @@ curl -sS -H "Authorization: Bearer mcp_human_controller_demo" \
 
 [`test/fixtures/oversized-schema.json`](test/fixtures/oversized-schema.json) is a compact recipe. The gateway expands it into `docs.mega_schema` on server `synthetic.oversized` so the inspector can show a three-order-of-magnitude gap versus `echo.ping`. Thresholds (defaults): tool 512 tokens, pack 1024, listed payload 2048. Ledger events: `schema.tax.recorded`, `schema.pack.opened`, `schema.pack.denied`, `schema.pack.flagged`.
 
+### Claim→allowlist fixtures
+
+[`test/fixtures/claim-allowlist.json`](test/fixtures/claim-allowlist.json) is the JWT profile: audience `mcp://governed-gateway`, HS256 demo HMAC, and `scope` → tool mappings. Tests mint tokens locally (`mintFixtureJwt`). Fail-closed cases: missing / invalid / expired / wrong-`aud` Bearer → HTTP 401. Guessed names and allowlist∩scope misses → JSON-RPC `-32001`. Opaque demo keys still use the registered allowlist when `scopes` is absent. See the [Principal-on-RPC cookbook](../../docs/principal-on-rpc.md). Host-injected `_meta` / pack-by-need: [`host-injected-meta`](../../openspec/changes/host-injected-meta/).
+
 ## Layout
 
 ```
-packages/governed-mcp-gateway/src/gateway.ts       HTTP + JSON-RPC + SSE + vault
-packages/governed-mcp-gateway/src/token-tax.ts     bytes→token heuristic + description/schema split
-packages/governed-mcp-gateway/src/host-meta.ts     host-only bind / strip / deny
-packages/governed-mcp-gateway/src/tool-catalog.ts  packs + oversized fixture expansion
-packages/governed-mcp-gateway/src/context-pack.ts  session packs, allow-by-need
-packages/shared                                    CHP gate, HMAC ledger, SSE helper
+packages/governed-mcp-gateway/src/gateway.ts           HTTP + JSON-RPC + SSE + vault
+packages/governed-mcp-gateway/src/claim-allowlist.ts   JWT Bearer + scope ∩ allowlist
+packages/governed-mcp-gateway/src/host-meta.ts         host-only bind / strip / deny
+packages/governed-mcp-gateway/src/token-tax.ts         bytes→token heuristic + description/schema split
+packages/governed-mcp-gateway/src/tool-catalog.ts      packs + oversized fixture expansion
+packages/governed-mcp-gateway/src/context-pack.ts      session packs, allow-by-need
+packages/governed-mcp-gateway/test/fixtures/           oversized schema + claim→allowlist
+packages/shared                                        CHP gate, HMAC JWT, ledger, SSE helper
+```
 ```
 
 Sister SKUs: [spend-mandate-plane](https://github.com/icohangar-ops/spend-mandate-plane) (`:7475`), [cfo-agent-mesh](https://github.com/icohangar-ops/cfo-agent-mesh) (`:7476`).
