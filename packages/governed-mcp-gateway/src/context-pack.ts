@@ -1,5 +1,10 @@
 import { isoNow } from "@cubiczan/shared";
 import { canExpose, defaultSeedTools, isMetaTool, namesInPack, type CatalogTool } from "./tool-catalog.ts";
+import {
+  InMemorySessionStore,
+  type SessionRecord,
+  type SessionStore,
+} from "./session-store.ts";
 
 export interface SessionPack {
   id: string;
@@ -7,6 +12,7 @@ export interface SessionPack {
   tools: string[];
   createdAt: string;
   updatedAt: string;
+  replicaId?: string;
 }
 
 export interface AdmitResult {
@@ -26,40 +32,64 @@ export function resolveSessionId(
   return raw && raw.length > 0 ? raw : `ses_${principalId}`;
 }
 
+function asPack(record: SessionRecord): SessionPack {
+  return {
+    id: record.id,
+    principalId: record.principalId,
+    tools: [...record.tools],
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    replicaId: record.replicaId,
+  };
+}
+
 export class ContextPackStore {
-  readonly sessions = new Map<string, SessionPack>();
+  readonly store: SessionStore;
+  readonly replicaId: string;
+
+  constructor(options: { store?: SessionStore; replicaId?: string } = {}) {
+    this.store = options.store ?? new InMemorySessionStore();
+    this.replicaId = options.replicaId ?? "local";
+  }
+
+  /** Snapshot of pack sessions (human inspector / tests). */
+  get sessions(): Map<string, SessionPack> {
+    return new Map([...this.store.values()].map((record) => [record.id, asPack(record)]));
+  }
 
   get(sessionId: string): SessionPack | undefined {
-    return this.sessions.get(sessionId);
+    const found = this.store.get(sessionId);
+    return found ? asPack(found) : undefined;
   }
 
   getOrCreate(sessionId: string, principalId: string, seed: string[]): SessionPack {
-    const existing = this.sessions.get(sessionId);
+    const existing = this.store.get(sessionId);
     if (existing) {
       if (existing.principalId !== principalId) {
         throw Object.assign(new Error("session belongs to another principal"), { code: "session_mismatch" });
       }
-      return existing;
+      return asPack(existing);
     }
     const now = isoNow();
-    const created: SessionPack = {
+    const created: SessionRecord = {
       id: sessionId,
+      replicaId: this.replicaId,
       principalId,
       tools: [...new Set(seed)],
       createdAt: now,
       updatedAt: now,
     };
-    this.sessions.set(sessionId, created);
-    return created;
+    this.store.put(created);
+    return asPack(created);
   }
 
   ensure(sessionId: string, principalId: string, allowlist: string[], catalog: readonly CatalogTool[]): SessionPack {
-    const existing = this.sessions.get(sessionId);
+    const existing = this.store.get(sessionId);
     if (existing) {
       if (existing.principalId !== principalId) {
         throw Object.assign(new Error("session belongs to another principal"), { code: "session_mismatch" });
       }
-      return existing;
+      return asPack(existing);
     }
     return this.getOrCreate(sessionId, principalId, defaultSeedTools(allowlist, catalog));
   }
@@ -99,8 +129,15 @@ export class ContextPackStore {
       admitted.push(name);
     }
 
-    session.tools = [...have];
-    session.updatedAt = isoNow();
-    return { sessionId, admitted, denied, tools: [...session.tools] };
+    const tools = [...have];
+    const existing = this.store.get(sessionId);
+    if (existing) {
+      this.store.put({
+        ...existing,
+        tools,
+        updatedAt: isoNow(),
+      });
+    }
+    return { sessionId, admitted, denied, tools };
   }
 }
