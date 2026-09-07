@@ -3,13 +3,16 @@ import {
   AuditLedger,
   applyHumanLock,
   bearer,
+  bearerFromAuthorization,
   createServer,
+  incomingToRequest,
   isoNow,
   newId,
   openSse,
   postJson,
   runChpGate,
   sendJson,
+  sendWebResponse,
   type Principal,
 } from "@cubiczan/shared";
 import type http from "node:http";
@@ -135,6 +138,65 @@ function asObject(value: Json | undefined): Record<string, Json> {
 function asStringArray(value: Json | undefined): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string");
+}
+
+export type GatewayRequest = http.IncomingMessage | Request;
+
+export interface JsonRpcError {
+  code: number;
+  message: string;
+  data?: unknown;
+}
+
+export interface JsonRpcResponse {
+  jsonrpc: "2.0";
+  id: Json;
+  result?: unknown;
+  error?: JsonRpcError;
+}
+
+function normalizePath(pathname: string): string {
+  return pathname.replace(/\/+$/, "") || "/";
+}
+
+function isMcpPath(pathname: string): boolean {
+  return pathname === "/mcp" || pathname === "/api" || pathname === "/";
+}
+
+function isHealthPath(pathname: string): boolean {
+  return pathname === "/health" || pathname === "/healthz";
+}
+
+function delegatedWebPath(method: string, pathname: string): boolean {
+  if (isHealthPath(pathname)) return true;
+  if (pathname === "/mcp" || pathname === "/api") return true;
+  if (pathname === "/" && (method === "POST" || method === "OPTIONS" || method === "DELETE")) return true;
+  return false;
+}
+
+function corsHeaders(request: Request): Record<string, string> {
+  const origin = request.headers.get("origin");
+  return {
+    "access-control-allow-origin": origin || "*",
+    "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+    "access-control-allow-headers":
+      "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID, X-Cubiczan-Session",
+    "access-control-expose-headers": "Mcp-Session-Id, MCP-Protocol-Version",
+    "access-control-max-age": "86400",
+    vary: "Origin",
+  };
+}
+
+function jsonResponse(status: number, body: unknown, extra: Record<string, string> = {}): Response {
+  const payload = JSON.stringify(body);
+  return new Response(payload, {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": String(Buffer.byteLength(payload)),
+      ...extra,
+    },
+  });
 }
 
 function headerValue(req: http.IncomingMessage, name: string): string {
@@ -309,7 +371,10 @@ export class GovernedGateway {
   }
 
   authenticate(req: http.IncomingMessage): BearerAuthResult {
-    const token = bearer(req);
+    return this.authenticateBearer(bearer(req));
+  }
+
+  authenticateBearer(token: string | undefined): BearerAuthResult {
     if (!token) return { ok: false, reason: "missing" };
 
     const id = this.keys.get(hash(token));
@@ -328,6 +393,11 @@ export class GovernedGateway {
       principal: principalFromJwtClaims(agent.principal, verified.claims),
       source: "jwt",
     };
+  }
+
+  principalForToken(token: string | undefined): Principal | undefined {
+    const result = this.authenticateBearer(token);
+    return result.ok ? result.principal : undefined;
   }
 
   resolvePrincipal(req: http.IncomingMessage): Principal | undefined {
@@ -367,10 +437,13 @@ export class GovernedGateway {
     };
   }
 
-  sessionIdFor(principal: Principal, params: Record<string, Json>, req?: http.IncomingMessage): string {
+  sessionIdFor(principal: Principal, params: Record<string, Json>, req?: GatewayRequest): string {
     const meta = asObject(asObject(params._meta).cubiczan);
-    const cubiczanHeader = req ? headerSession(req) : "";
-    const transportHeader = req && this.sessionMode !== "stateless" ? mcpSessionHeader(req) : "";
+    const cubiczanHeader = req ? (req instanceof Request ? (req.headers.get("x-cubiczan-session") ?? "") : headerSession(req)) : "";
+    const transportHeader =
+      req && this.sessionMode !== "stateless"
+        ? (req instanceof Request ? (req.headers.get("mcp-session-id") ?? "").trim() : mcpSessionHeader(req))
+        : "";
     return resolveSessionId(
       principal.id,
       typeof params.sessionId === "string" ? params.sessionId : undefined,
@@ -490,14 +563,16 @@ export class GovernedGateway {
     );
   }
 
-  private headerValue(req: http.IncomingMessage | undefined, name: string): string {
+  private headerValue(req: GatewayRequest | undefined, name: string): string {
     if (!req) return "";
+    if (req instanceof Request) return req.headers.get(name) ?? "";
     const raw = req.headers[name];
     return typeof raw === "string" ? raw : Array.isArray(raw) ? (raw[0] ?? "") : "";
   }
 
-  private queryValue(req: http.IncomingMessage | undefined, name: string): string {
+  private queryValue(req: GatewayRequest | undefined, name: string): string {
     if (!req) return "";
+    if (req instanceof Request) return new URL(req.url).searchParams.get(name) ?? "";
     const host = req.headers.host ?? "localhost";
     const url = new URL(req.url ?? "/", `http://${host}`);
     return url.searchParams.get(name) ?? "";
@@ -506,7 +581,7 @@ export class GovernedGateway {
   hostBindingsFor(
     principal: Principal,
     params: Record<string, Json>,
-    req?: http.IncomingMessage,
+    req?: GatewayRequest,
   ): HostBindResult {
     const hostMeta = asObject(asObject(asObject(params._meta).cubiczan).host);
     return bindHostBindings({
@@ -665,7 +740,7 @@ export class GovernedGateway {
     return result;
   }
 
-  listTools(principal: Principal, params: Record<string, Json>, req?: http.IncomingMessage): {
+  listTools(principal: Principal, params: Record<string, Json>, req?: GatewayRequest): {
     tools: Array<{ name: string; description: string; inputSchema: Json }>;
     _meta: Record<string, Json>;
   } {
@@ -856,13 +931,10 @@ export class GovernedGateway {
 
   createHttpServer(): http.Server {
     return createServer(async (req, res, url, body) => {
-      if (req.method === "GET" && url.pathname === "/health") {
-        sendJson(res, 200, {
-          ok: true,
-          service: "governed-mcp-gateway",
-          sessionMode: this.sessionMode,
-          replicaId: this.replicaId,
-        });
+      const path = normalizePath(url.pathname);
+      if ((req.method === "GET" || req.method === "HEAD") && isHealthPath(path)) {
+        const webRes = await this.handleWebRequest(incomingToRequest(req, url, body));
+        await sendWebResponse(res, webRes);
         return;
       }
 
@@ -1189,4 +1261,184 @@ export class GovernedGateway {
       sendJson(res, 404, { error: "not found" });
     });
   }
+
+  healthPayload(): Record<string, Json> {
+    return {
+      ok: true,
+      service: "governed-mcp-gateway",
+      transport: "streamable-http",
+      mode: this.sessionMode,
+      replicaId: this.replicaId,
+    };
+  }
+
+  initializeResult(): Record<string, Json> {
+    return {
+      protocolVersion: "2025-03-26",
+      serverInfo: {
+        name: "governed-mcp-gateway",
+        version: "0.1.0",
+        title: "Governed MCP Gateway",
+      },
+      capabilities: {
+        tools: { listChanged: false },
+        logging: {},
+        cubiczan: { sessionMode: this.sessionMode, replicaId: this.replicaId },
+      },
+    };
+  }
+
+  async handleWebRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const pathname = normalizePath(url.pathname);
+    const cors = corsHeaders(request);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors });
+    }
+
+    if ((request.method === "GET" || request.method === "HEAD") && isHealthPath(pathname)) {
+      const payload = JSON.stringify(this.healthPayload());
+      return new Response(request.method === "HEAD" ? null : payload, {
+        status: 200,
+        headers: {
+          ...cors,
+          "content-type": "application/json; charset=utf-8",
+          "content-length": String(Buffer.byteLength(payload)),
+        },
+      });
+    }
+
+    if (!isMcpPath(pathname)) {
+      return jsonResponse(404, { error: "not found" }, cors);
+    }
+
+    const auth = this.authenticateBearer(bearerFromAuthorization(request.headers.get("authorization")));
+    if (!auth.ok) {
+      return jsonResponse(401, { error: "unauthorized", reason: auth.reason }, {
+        ...cors,
+        "www-authenticate": 'Bearer realm="governed-mcp-gateway", error="invalid_token"',
+      });
+    }
+    const principal = auth.principal;
+
+    if (request.method === "DELETE") {
+      return jsonResponse(200, { ok: true, closed: request.headers.get("mcp-session-id") ?? null }, {
+        ...cors,
+        "mcp-protocol-version": "2025-03-26",
+      });
+    }
+
+    if (request.method !== "POST") {
+      return jsonResponse(
+        405,
+        { jsonrpc: "2.0", id: null, error: { code: -32000, message: "Method not allowed." } },
+        cors,
+      );
+    }
+
+    let obj: Record<string, Json> = {};
+    try {
+      const text = await request.text();
+      if (text.trim()) obj = asObject(JSON.parse(text) as Json);
+    } catch {
+      return jsonResponse(400, { error: "invalid json" }, cors);
+    }
+
+    const rpc = await this.handleJsonRpc(principal, obj, request);
+    return jsonResponse(200, rpc ?? { jsonrpc: "2.0", id: null, result: {} }, {
+      ...cors,
+      "mcp-protocol-version": "2025-03-26",
+    });
+  }
+
+  async handleJsonRpc(
+    principal: Principal,
+    obj: Record<string, Json>,
+    req?: GatewayRequest,
+  ): Promise<JsonRpcResponse | undefined> {
+    const method = String(obj.method ?? "");
+    const id = (Object.prototype.hasOwnProperty.call(obj, "id") ? obj.id : null) ?? null;
+    if (method.startsWith("notifications/")) return undefined;
+
+    if (method === "initialize") {
+      return { jsonrpc: "2.0", id, result: this.initializeResult() };
+    }
+    if (method === "ping") {
+      return { jsonrpc: "2.0", id, result: {} };
+    }
+    if (method === "tools/list") {
+      try {
+        return { jsonrpc: "2.0", id, result: this.listTools(principal, asObject(obj.params), req) };
+      } catch (error) {
+        const rpc = (error as { rpc?: JsonRpcError }).rpc;
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: rpc ?? { code: -32000, message: error instanceof Error ? error.message : String(error) },
+        };
+      }
+    }
+    if (method === "resources/list") {
+      return { jsonrpc: "2.0", id, result: { resources: [] } };
+    }
+    if (method === "prompts/list") {
+      return { jsonrpc: "2.0", id, result: { prompts: [] } };
+    }
+    if (method === "tools/call") {
+      const paramsIn = asObject(obj.params);
+      const claimed = asObject(asObject(asObject(paramsIn._meta).cubiczan).principal);
+      const impersonation = claimedPrincipalConflict(principal, claimed);
+      if (impersonation) {
+        try {
+          this.denyHost(principal, impersonation, ["principal"], String(paramsIn.name ?? ""));
+        } catch (error) {
+          const rpc = (error as { rpc?: JsonRpcError }).rpc;
+          return { jsonrpc: "2.0", id, error: rpc ?? { code: -32006, message: impersonation } };
+        }
+      }
+      const hostBound = this.hostBindingsFor(principal, paramsIn, req);
+      if (!hostBound.ok) {
+        try {
+          this.denyHost(principal, hostBound.reason, hostBound.invented, String(paramsIn.name ?? ""));
+        } catch (error) {
+          const rpc = (error as { rpc?: JsonRpcError }).rpc;
+          return { jsonrpc: "2.0", id, error: rpc ?? { code: -32006, message: hostBound.reason } };
+        }
+      }
+      const attached = this.attachPrincipal(obj, principal, hostBound.host);
+      const params = asObject(attached.params);
+      const name = String(params.name ?? "");
+      const args = asObject(params.arguments);
+      try {
+        const result = await this.dispatchTool(principal, name, args, hostBound.host);
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: JSON.stringify(result) }],
+            _meta: this.metaFor(principal, { host: hostBound.host as unknown as Json }),
+            structuredContent: result,
+          },
+        };
+      } catch (error) {
+        const rpc = (error as { rpc?: JsonRpcError }).rpc;
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: rpc ?? { code: -32000, message: error instanceof Error ? error.message : String(error) },
+        };
+      }
+    }
+    return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown method ${method}` } };
+  }
+}
+
+export function createSeededGateway(options: GatewayOptions = {}): GovernedGateway {
+  const gateway = new GovernedGateway({
+    spendPlaneUrl: process.env.SPEND_PLANE_URL,
+    ...options,
+  });
+  gateway.seedDemo();
+  return gateway;
 }

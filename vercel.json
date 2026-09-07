@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "fluid": true,
+  "rewrites": [
+    { "source": "/mcp", "destination": "/api" },
+    { "source": "/health", "destination": "/api" },
+    { "source": "/healthz", "destination": "/api" }
+  ],
+  "functions": {
+    "api/index.mjs": {
+      "maxDuration": 60,
+      "includeFiles": "{packages/**,package.json,package-lock.json,tsconfig.base.json}"
+    }
+  }
+}

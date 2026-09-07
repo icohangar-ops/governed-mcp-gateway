@@ -1,0 +1,3 @@
+docs/screenshots
+**/*.test.ts
+.git
