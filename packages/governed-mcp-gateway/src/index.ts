@@ -1,4 +1,13 @@
-export { GovernedGateway, type ContextTaxReport, type GatewayOptions } from "./gateway.ts";
+export {
+  GovernedGateway,
+  createSeededGateway,
+  type ContextTaxReport,
+  type GatewayOptions,
+  type GatewayRequest,
+  type JsonRpcError,
+  type JsonRpcResponse,
+} from "./gateway.ts";
+export { handleWebRequest, resetSeededWebGateway, seededWebGateway } from "./web.ts";
 export {
   effectiveAllowlist,
   intersectAllowlist,

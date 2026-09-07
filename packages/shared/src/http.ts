@@ -40,12 +40,42 @@ export function sendJson(
   res.end(payload);
 }
 
-export function bearer(req: http.IncomingMessage): string | undefined {
-  const header = req.headers.authorization;
+export function bearerFromAuthorization(header: string | null | undefined): string | undefined {
   if (!header) return undefined;
-  const [scheme, token] = header.split(" ");
-  if (scheme?.toLowerCase() !== "bearer" || !token) return undefined;
-  return token;
+  const match = /^Bearer\s+(\S+)\s*$/i.exec(header.trim());
+  return match?.[1];
+}
+
+export function bearer(req: http.IncomingMessage): string | undefined {
+  const raw = req.headers.authorization;
+  const header = typeof raw === "string" ? raw : Array.isArray(raw) ? raw[0] : undefined;
+  return bearerFromAuthorization(header);
+}
+
+export function incomingToRequest(req: http.IncomingMessage, url: URL, body?: Json): Request {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value == null) continue;
+    headers.set(key, Array.isArray(value) ? value.join(", ") : String(value));
+  }
+  const method = req.method ?? "GET";
+  const init: RequestInit = { method, headers };
+  if (method !== "GET" && method !== "HEAD" && body !== undefined) {
+    init.body = JSON.stringify(body);
+  }
+  return new Request(url.href, init);
+}
+
+export async function sendWebResponse(res: http.ServerResponse, response: Response): Promise<void> {
+  res.statusCode = response.status;
+  response.headers.forEach((value, key) => {
+    res.setHeader(key, value);
+  });
+  if (!response.body) {
+    res.end();
+    return;
+  }
+  res.end(Buffer.from(await response.arrayBuffer()));
 }
 
 export function createServer(handler: Handler): http.Server {

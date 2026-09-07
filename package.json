@@ -14,10 +14,14 @@
     "gateway": "npm start -w @cubiczan/governed-mcp-gateway",
     "spend": "npm start -w @cubiczan/spend-mandate-plane",
     "cfo": "npm start -w @cubiczan/cfo-agent-mesh",
-    "shots": "node --import tsx scripts/capture-live.ts && python3 scripts/render-readme-shots.py"
+    "shots": "node --import tsx scripts/capture-live.ts && python3 scripts/render-readme-shots.py",
+    "mcp:http:smoke": "node --import tsx scripts/mcp-http-smoke.ts"
   },
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "tsx": "^4.19.3"
+  }
 }
