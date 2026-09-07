@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Json, Principal } from "@cubiczan/shared";
+import { stripHostOnlyFromSchema } from "./host-meta.ts";
+import type { HostBindings } from "./host-meta.ts";
 import { listedToolShape, measureToolSchema, type ToolTax, type TaxThresholds } from "./token-tax.ts";
 
 export const META_TOOLS = ["context.inspect", "context.need"] as const;
@@ -14,6 +16,8 @@ export interface CatalogTool {
   pack: string;
   server: string;
   meta?: boolean;
+  /** Keys the host binds on `_meta`. Hidden from listed schemas. */
+  hostOnly?: string[];
 }
 
 export interface OversizedFixtureRecipe {
@@ -108,6 +112,22 @@ export function builtInCatalog(): CatalogTool[] {
       }),
     },
     {
+      name: "index.query",
+      description:
+        "Query a host-scoped search index. Tenant and index are host-injected via _meta — never pass them as arguments.",
+      pack: "tenant",
+      server: DEFAULT_SERVER,
+      hostOnly: ["tenant", "index"],
+      inputSchema: objectSchema(
+        {
+          query: { type: "string", description: "Query string." },
+          tenant: { type: "string", description: "Host-only. Stripped from tools/list." },
+          index: { type: "string", description: "Host-only. Stripped from tools/list." },
+        },
+        ["query"],
+      ),
+    },
+    {
       name: "context.inspect",
       description: "Inspect the current session pack, schema token tax, and estate flags.",
       pack: "catalog",
@@ -139,7 +159,11 @@ export function isMetaTool(name: string): boolean {
 }
 
 export function toListedTool(tool: CatalogTool): { name: string; description: string; inputSchema: Json } {
-  return listedToolShape(tool);
+  const listed = listedToolShape(tool);
+  return {
+    ...listed,
+    inputSchema: stripHostOnlyFromSchema(listed.inputSchema, tool.hostOnly),
+  };
 }
 
 export function catalogTaxes(tools: CatalogTool[], thresholds: TaxThresholds): ToolTax[] {
@@ -163,4 +187,8 @@ export function canExpose(name: string, allowlist: string[]): boolean {
   return isMetaTool(name) || allowlist.includes(name);
 }
 
-export type ToolImpl = (args: Record<string, Json>, principal: Principal) => Json;
+export type ToolImpl = (
+  args: Record<string, Json>,
+  principal: Principal,
+  host: HostBindings,
+) => Json;

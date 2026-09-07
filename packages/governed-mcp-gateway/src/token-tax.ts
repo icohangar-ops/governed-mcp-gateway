@@ -21,7 +21,13 @@ export interface ToolTax {
   pack: string;
   bytes: number;
   tokens: number;
+  descriptionBytes: number;
+  descriptionTokens: number;
+  schemaBytes: number;
+  schemaTokens: number;
   oversized: boolean;
+  oversizedDescription: boolean;
+  oversizedSchema: boolean;
 }
 
 export interface PackTax {
@@ -94,14 +100,23 @@ export function measureToolSchema(
   },
   toolThreshold = DEFAULT_TAX_THRESHOLDS.toolTokens,
 ): ToolTax {
-  const { bytes, tokens } = measureJson(listedToolShape(tool));
+  const listed = listedToolShape(tool);
+  const { bytes, tokens } = measureJson(listed);
+  const description = measureJson(listed.description);
+  const schema = measureJson(listed.inputSchema);
   return {
     name: tool.name,
     server: tool.server ?? "governed-mcp-gateway",
     pack: tool.pack ?? "core",
     bytes,
     tokens,
+    descriptionBytes: description.bytes,
+    descriptionTokens: description.tokens,
+    schemaBytes: schema.bytes,
+    schemaTokens: schema.tokens,
     oversized: tokens >= toolThreshold,
+    oversizedDescription: description.tokens >= toolThreshold,
+    oversizedSchema: schema.tokens >= toolThreshold,
   };
 }
 

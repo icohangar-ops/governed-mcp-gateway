@@ -26,6 +26,7 @@
 | `core` | `echo.ping` |
 | `payments` | `stripe.charge` |
 | `research` | `search.web` |
+| `tenant` | `index.query` (host-injected tenant / index; not in the default pack) |
 | `bloat` | `docs.mega_schema` (fixture) |
 
 ## Thresholds (defaults)
