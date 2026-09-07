@@ -3,7 +3,6 @@ import {
   AuditLedger,
   applyHumanLock,
   bearer,
-  canonicalJson,
   createServer,
   isoNow,
   newId,
@@ -15,18 +14,15 @@ import {
 } from "@cubiczan/shared";
 import type http from "node:http";
 import type { Json } from "@cubiczan/shared";
-import {
-  GATEWAY_AUDIENCE,
-  SCOPE_INVOKE,
-  denyScopeIfRequired,
-  intersectTools,
-  TOKEN_PREFIX,
-  mintBearerToken,
-  verifyClaimToken,
-  type AuthDenyReason,
-  type BearerClaims,
-} from "./auth.ts";
 import { ContextPackStore, resolveSessionId, type AdmitResult } from "./context-pack.ts";
+import {
+  bindHostBindings,
+  claimedPrincipalConflict,
+  inventedHostKeys,
+  stripHostOnlyKeys,
+  type HostBindResult,
+  type HostBindings,
+} from "./host-meta.ts";
 import {
   DEFAULT_TAX_THRESHOLDS,
   groupByServer,
@@ -43,7 +39,6 @@ import {
 import {
   builtInCatalog,
   canExpose,
-  isMetaTool,
   toListedTool,
   type CatalogTool,
   type ToolImpl,
@@ -61,51 +56,15 @@ export interface AgentRecord {
   principal: Principal;
   apiKeyHash: string;
   allowlist: string[];
-  scopes: string[];
-  policyVersion: number;
   spendCapCents: number;
   spendUsedCents: number;
   policyMaxAutoCents: number;
 }
 
-export interface PendingLock {
-  id: string;
-  principalId: string;
-  tool: string;
-  argHash: string;
-  policyVersion: number;
-  state: "pending" | "approved" | "rejected" | "consumed";
-  createdAt: string;
-}
-
 export interface GatewayOptions {
   spendPlaneUrl?: string;
   auditKey?: string;
-  tokenKey?: string;
-  audience?: string;
   taxThresholds?: Partial<TaxThresholds>;
-}
-
-export type AuthOk = {
-  ok: true;
-  principal: Principal;
-  claims: BearerClaims;
-  agent: AgentRecord;
-};
-
-export type AuthDenied = {
-  ok: false;
-  reason: AuthDenyReason;
-  principalId?: string;
-};
-
-export type AuthResult = AuthOk | AuthDenied;
-
-export interface CubiczanMeta {
-  principal: Principal;
-  allowedTools: string[];
-  scopes: string[];
-  policyVersion: number;
 }
 
 export interface ContextTaxReport {
@@ -139,10 +98,6 @@ function hash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function argHash(args: Record<string, Json>): string {
-  return hash(canonicalJson(args));
-}
-
 function preview(value: string): string {
   return `${value.slice(0, 6)}…${value.slice(-4)}`;
 }
@@ -162,52 +117,53 @@ function headerSession(req: http.IncomingMessage): string {
   return typeof raw === "string" ? raw : Array.isArray(raw) ? (raw[0] ?? "") : "";
 }
 
-function rpcError(code: number, message: string, data?: unknown): Error {
-  return Object.assign(new Error(message), { rpc: { code, message, data } });
-}
-
 export class GovernedGateway {
   readonly ledger: AuditLedger;
   readonly credentials = new Map<string, Credential>();
   readonly agents = new Map<string, AgentRecord>();
   readonly keys = new Map<string, string>();
-  readonly locks = new Map<string, PendingLock>();
   readonly catalog = new Map<string, CatalogTool>();
   readonly tools = new Map<string, ToolImpl>();
   readonly packs = new ContextPackStore();
   readonly thresholds: TaxThresholds;
-  readonly audience: string;
-  readonly tokenKey: string;
   private seq = 0;
 
   constructor(private readonly options: GatewayOptions = {}) {
-    const auditKey = options.auditKey ?? "gateway-demo-key";
-    this.ledger = new AuditLedger(auditKey);
-    this.tokenKey = options.tokenKey ?? auditKey;
-    this.audience = options.audience ?? GATEWAY_AUDIENCE;
+    this.ledger = new AuditLedger(options.auditKey ?? "gateway-demo-key");
     this.thresholds = { ...DEFAULT_TAX_THRESHOLDS, ...options.taxThresholds };
     for (const def of builtInCatalog()) this.catalog.set(def.name, def);
 
-    this.tools.set("echo.ping", (args, principal) => ({
+    this.tools.set("echo.ping", (args, principal, host) => ({
       pong: true,
       echo: args,
       principal,
+      host,
     }));
-    this.tools.set("stripe.charge", (args, principal) => ({
+    this.tools.set("stripe.charge", (args, principal, host) => ({
       simulated: true,
       amountCents: args.amountCents ?? 0,
       principal,
+      host,
     }));
-    this.tools.set("search.web", (args, principal) => ({
+    this.tools.set("search.web", (args, principal, host) => ({
       hits: [],
       query: args.query ?? "",
       principal,
+      host,
+    }));
+    this.tools.set("index.query", (args, principal, host) => ({
+      hits: [],
+      query: args.query ?? "",
+      tenant: host.tenant,
+      index: host.index,
+      principal,
+      host,
     }));
     this.tools.set("context.inspect", (args, principal) => this.inspectContext(principal, args));
     this.tools.set("context.need", (args, principal) => this.needContext(principal, args) as unknown as Json);
-    this.tools.set("docs.mega_schema", (_args, principal) => {
+    this.tools.set("docs.mega_schema", (_args, principal, host) => {
       const tax = this.toolTax("docs.mega_schema");
-      return { accepted: true, principal, tokens: tax?.tokens ?? 0, bytes: tax?.bytes ?? 0 };
+      return { accepted: true, principal, host, tokens: tax?.tokens ?? 0, bytes: tax?.bytes ?? 0 };
     });
   }
 
@@ -229,7 +185,7 @@ export class GovernedGateway {
         displayName: "PayOps Runner",
       },
       agentKey,
-      ["echo.ping", "stripe.charge"],
+      ["echo.ping", "stripe.charge", "index.query"],
       50_000,
       5_000,
     );
@@ -241,7 +197,7 @@ export class GovernedGateway {
         displayName: "Research Scout",
       },
       researchKey,
-      ["echo.ping", "search.web"],
+      ["echo.ping", "search.web", "index.query"],
       10_000,
       1_000,
     );
@@ -267,32 +223,16 @@ export class GovernedGateway {
     allowlist: string[],
     spendCapCents: number,
     policyMaxAutoCents: number,
-    scopes: string[] = [SCOPE_INVOKE],
   ): void {
-    const existing = this.agents.get(principal.id);
-    if (existing) this.keys.delete(existing.apiKeyHash);
     const hashed = hash(apiKey);
     this.keys.set(hashed, principal.id);
     this.agents.set(principal.id, {
       principal,
       apiKeyHash: hashed,
       allowlist,
-      scopes,
-      policyVersion: (existing?.policyVersion ?? 0) + 1,
       spendCapCents,
-      spendUsedCents: existing?.spendUsedCents ?? 0,
+      spendUsedCents: 0,
       policyMaxAutoCents,
-    });
-  }
-
-  issueToken(claims: Omit<BearerClaims, "v"> & { v?: 1 }): string {
-    return mintBearerToken(this.tokenKey, {
-      v: 1,
-      sub: claims.sub,
-      aud: claims.aud,
-      scope: claims.scope,
-      exp: claims.exp,
-      iat: claims.iat,
     });
   }
 
@@ -326,113 +266,27 @@ export class GovernedGateway {
     return Boolean(cred && cred.hash === hash(secret));
   }
 
-  /**
-   * Fail-closed Bearer authorization. Never returns a principal on deny.
-   * Does not cache the token or principal on a session.
-   */
-  authenticate(req: http.IncomingMessage, requiredScope?: string): AuthResult {
-    const token = bearer(req);
-    if (!token) return { ok: false, reason: "missing" };
-
-    if (token.startsWith(`${TOKEN_PREFIX}.`)) {
-      const verified = verifyClaimToken(token, this.tokenKey, this.audience);
-      if (!verified.ok) return verified;
-      const agent = this.agents.get(verified.claims.sub);
-      if (!agent) return { ok: false, reason: "invalid" };
-      const scopeReason = denyScopeIfRequired(verified.claims.scope, requiredScope);
-      if (scopeReason) {
-        return { ok: false, reason: scopeReason, principalId: agent.principal.id };
-      }
-      return { ok: true, principal: agent.principal, claims: verified.claims, agent };
-    }
-
-    const id = this.keys.get(hash(token));
-    if (!id) return { ok: false, reason: "invalid" };
-    const agent = this.agents.get(id);
-    if (!agent) return { ok: false, reason: "invalid" };
-    const claims: BearerClaims = {
-      v: 1,
-      sub: agent.principal.id,
-      aud: this.audience,
-      scope: agent.scopes,
-    };
-    const scopeReason = denyScopeIfRequired(claims.scope, requiredScope);
-    if (scopeReason) {
-      return { ok: false, reason: scopeReason, principalId: agent.principal.id };
-    }
-    return { ok: true, principal: agent.principal, claims, agent };
-  }
-
   resolvePrincipal(req: http.IncomingMessage): Principal | undefined {
-    const auth = this.authenticate(req);
-    return auth.ok ? auth.principal : undefined;
-  }
-
-  grantsFor(auth: AuthOk): CubiczanMeta {
-    return {
-      principal: auth.principal,
-      allowedTools: intersectTools(auth.agent.allowlist, auth.claims.scope),
-      scopes: auth.claims.scope,
-      policyVersion: auth.agent.policyVersion,
-    };
+    const token = bearer(req);
+    if (!token) return undefined;
+    const id = this.keys.get(hash(token));
+    if (!id) return undefined;
+    return this.agents.get(id)?.principal;
   }
 
   attachPrincipal(
     payload: Record<string, Json>,
     principal: Principal,
-    grants?: Omit<CubiczanMeta, "principal">,
+    host?: HostBindings,
   ): Record<string, Json> {
     const params = asObject(payload.params);
     const meta = asObject(params._meta);
     const cubiczan = asObject(meta.cubiczan);
     cubiczan.principal = principal as unknown as Json;
-    if (grants) {
-      cubiczan.allowedTools = grants.allowedTools as unknown as Json;
-      cubiczan.scopes = grants.scopes as unknown as Json;
-      cubiczan.policyVersion = grants.policyVersion;
-    }
+    if (host) cubiczan.host = host as unknown as Json;
     meta.cubiczan = cubiczan;
     params._meta = meta;
     return { ...payload, params };
-  }
-
-  recordDecision(input: {
-    decision: "allow" | "deny";
-    tool: string;
-    argHash: string;
-    principalId: string;
-    policyVersion: number;
-    reason?: string;
-  }) {
-    return this.ledger.append({
-      event: "authz.decision",
-      actor: input.principalId,
-      inputs: {
-        decision: input.decision,
-        tool: input.tool,
-        argHash: input.argHash,
-        principalId: input.principalId,
-        policyVersion: input.policyVersion,
-        reason: input.reason ?? input.decision,
-      },
-      sources: ["authz"],
-    });
-  }
-
-  applyLock(lockId: string, decision: "approve" | "reject", notes?: string) {
-    const lock = this.locks.get(lockId);
-    if (!lock) throw new Error("unknown lock");
-    if (lock.state !== "pending") throw new Error(`lock is ${lock.state}`);
-    const outcome = applyHumanLock(decision, notes);
-    lock.state = decision === "approve" ? "approved" : "rejected";
-    this.ledger.append({
-      event: "chp.lock",
-      actor: lock.principalId,
-      inputs: { lockId, decision, tool: lock.tool, argHash: lock.argHash },
-      sources: ["chp", "human"],
-      rationale: outcome.rationale,
-    });
-    return { ...outcome, lockId, tool: lock.tool, argHash: lock.argHash, lockState: lock.state };
   }
 
   sessionIdFor(principal: Principal, params: Record<string, Json>, req?: http.IncomingMessage): string {
@@ -445,6 +299,53 @@ export class GovernedGateway {
     );
   }
 
+  private headerValue(req: http.IncomingMessage | undefined, name: string): string {
+    if (!req) return "";
+    const raw = req.headers[name];
+    return typeof raw === "string" ? raw : Array.isArray(raw) ? (raw[0] ?? "") : "";
+  }
+
+  private queryValue(req: http.IncomingMessage | undefined, name: string): string {
+    if (!req) return "";
+    const host = req.headers.host ?? "localhost";
+    const url = new URL(req.url ?? "/", `http://${host}`);
+    return url.searchParams.get(name) ?? "";
+  }
+
+  hostBindingsFor(
+    principal: Principal,
+    params: Record<string, Json>,
+    req?: http.IncomingMessage,
+  ): HostBindResult {
+    const hostMeta = asObject(asObject(asObject(params._meta).cubiczan).host);
+    return bindHostBindings({
+      principal,
+      tenantClaim: {
+        header: this.headerValue(req, "x-cubiczan-tenant"),
+        query: this.queryValue(req, "tenant"),
+        meta: typeof hostMeta.tenant === "string" ? hostMeta.tenant : "",
+      },
+      indexClaim: {
+        header: this.headerValue(req, "x-cubiczan-index"),
+        query: this.queryValue(req, "index"),
+        meta: typeof hostMeta.index === "string" ? hostMeta.index : "",
+      },
+      vault: [...this.credentials.values()].map((cred) => ({ name: cred.name, version: cred.version })),
+    });
+  }
+
+  denyHost(principal: Principal, reason: string, invented: string[], name?: string): never {
+    this.ledger.append({
+      event: "host.meta.denied",
+      actor: principal.id,
+      inputs: { reason, invented, name: name ?? null },
+      sources: ["host-meta"],
+    });
+    throw Object.assign(new Error(reason), {
+      rpc: { code: -32006, message: reason, data: { invented } },
+    });
+  }
+
   allowlistOf(principal: Principal): string[] {
     return this.agents.get(principal.id)?.allowlist ?? [];
   }
@@ -452,11 +353,15 @@ export class GovernedGateway {
   toolTax(name: string): ToolTax | undefined {
     const def = this.catalog.get(name);
     if (!def) return undefined;
-    return measureToolSchema(def, this.thresholds.toolTokens);
+    const listed = toListedTool(def);
+    return measureToolSchema({ ...def, ...listed }, this.thresholds.toolTokens);
   }
 
   estateTaxes(): ToolTax[] {
-    return [...this.catalog.values()].map((def) => measureToolSchema(def, this.thresholds.toolTokens));
+    return [...this.catalog.values()].map((def) => {
+      const listed = toListedTool(def);
+      return measureToolSchema({ ...def, ...listed }, this.thresholds.toolTokens);
+    });
   }
 
   estateReport(): ContextTaxReport["estate"] {
@@ -565,33 +470,19 @@ export class GovernedGateway {
     return result;
   }
 
-  listTools(
-    principal: Principal,
-    params: Record<string, Json>,
-    req?: http.IncomingMessage,
-    grants?: Omit<CubiczanMeta, "principal">,
-  ): {
+  listTools(principal: Principal, params: Record<string, Json>, req?: http.IncomingMessage): {
     tools: Array<{ name: string; description: string; inputSchema: Json }>;
-    _meta: {
-      cubiczan: {
-        principal: Principal;
-        sessionId: string;
-        tax: ListTax;
-        allowedTools?: string[];
-        scopes?: string[];
-        policyVersion?: number;
-      };
-    };
+    _meta: { cubiczan: { principal: Principal; sessionId: string; tax: ListTax; host: HostBindings } };
   } {
     const sessionId = this.sessionIdFor(principal, params, req);
     const catalog = [...this.catalog.values()];
-    const allowlist = this.allowlistOf(principal);
-    const session = this.packs.ensure(sessionId, principal.id, allowlist, catalog);
+    const session = this.packs.ensure(sessionId, principal.id, this.allowlistOf(principal), catalog);
     const need = asStringArray(params.need);
     const pack = typeof params.pack === "string" ? params.pack : undefined;
     if (need.length > 0 || pack) this.admitNeed(principal, sessionId, { tools: need, pack });
 
     const mode = params.mode === "full" ? "full" : "pack";
+    const allowlist = this.allowlistOf(principal);
     const names =
       mode === "full"
         ? [...new Set([...allowlist, "context.inspect", "context.need"])]
@@ -637,22 +528,12 @@ export class GovernedGateway {
       });
     }
 
+    const hostBound = this.hostBindingsFor(principal, params, req);
+    if (!hostBound.ok) this.denyHost(principal, hostBound.reason, hostBound.invented, "tools/list");
+
     return {
       tools: listed,
-      _meta: {
-        cubiczan: {
-          principal,
-          sessionId,
-          tax,
-          ...(grants
-            ? {
-                allowedTools: grants.allowedTools,
-                scopes: grants.scopes,
-                policyVersion: grants.policyVersion,
-              }
-            : {}),
-        },
-      },
+      _meta: { cubiczan: { principal, sessionId, tax, host: hostBound.host } },
     };
   }
 
@@ -684,75 +565,35 @@ export class GovernedGateway {
     principal: Principal,
     name: string,
     args: Record<string, Json>,
-    grants?: Omit<CubiczanMeta, "principal">,
+    host: HostBindings,
   ): Promise<Json> {
     const agent = this.agents.get(principal.id);
     if (!agent) throw new Error("unknown principal");
-    const digest = argHash(args);
-    const policyVersion = grants?.policyVersion ?? agent.policyVersion;
-    const allowedTools = grants?.allowedTools ?? intersectTools(agent.allowlist, agent.scopes);
-    const scopes = grants?.scopes ?? agent.scopes;
-
-    if (!canExpose(name, agent.allowlist) || (!isMetaTool(name) && !allowedTools.includes(name))) {
-      this.recordDecision({
-        decision: "deny",
-        tool: name,
-        argHash: digest,
-        principalId: principal.id,
-        policyVersion,
-        reason: "allowlist",
+    if (!canExpose(name, agent.allowlist)) {
+      const error = { code: -32001, message: `tool ${name} is not on the allowlist` };
+      this.ledger.append({
+        event: "tool.denied",
+        actor: principal.id,
+        inputs: { name },
+        sources: ["allowlist"],
       });
-      throw rpcError(-32001, `tool ${name} is not on the allowlist`);
-    }
-    if (!isMetaTool(name) && !intersectTools(agent.allowlist, scopes).includes(name)) {
-      this.recordDecision({
-        decision: "deny",
-        tool: name,
-        argHash: digest,
-        principalId: principal.id,
-        policyVersion,
-        reason: "wrong_scope",
-      });
-      throw rpcError(-32001, `tool ${name} is not in the token scope`);
+      throw Object.assign(new Error(error.message), { rpc: error });
     }
 
-    const related = [...this.locks.values()].filter(
-      (lock) => lock.principalId === principal.id && lock.tool === name,
-    );
-    const unusedApproved = related.find((lock) => lock.state === "approved");
-    if (unusedApproved && unusedApproved.argHash !== digest) {
-      this.recordDecision({
-        decision: "deny",
-        tool: name,
-        argHash: digest,
-        principalId: principal.id,
-        policyVersion,
-        reason: "changed_arguments",
-      });
-      throw rpcError(-32006, "changed_arguments", {
-        expectedArgHash: unusedApproved.argHash,
-        argHash: digest,
-        lockId: unusedApproved.id,
-      });
+    const def = this.catalog.get(name);
+    const extraHostKeys = [...(def?.hostOnly ?? []), ...this.credentials.keys()];
+    const invented = inventedHostKeys(args, extraHostKeys);
+    if (invented.length > 0) {
+      stripHostOnlyKeys(args, extraHostKeys);
+      this.denyHost(principal, `model invented host-only argument(s): ${invented.join(", ")}`, invented, name);
     }
-
-    const consumed = related.find((lock) => lock.state === "consumed" && lock.argHash === digest);
-    if (consumed && !unusedApproved) {
-      this.recordDecision({
-        decision: "deny",
-        tool: name,
-        argHash: digest,
-        principalId: principal.id,
-        policyVersion,
-        reason: "replay",
-      });
-      throw rpcError(-32007, "replay", { lockId: consumed.id, argHash: digest });
-    }
-
-    let usedApprovedLock = false;
-    if (unusedApproved && unusedApproved.argHash === digest) {
-      unusedApproved.state = "consumed";
-      usedApprovedLock = true;
+    for (const key of def?.hostOnly ?? []) {
+      if (key === "index" && !host.index) {
+        this.denyHost(principal, "host index is not bound", ["index"], name);
+      }
+      if (key === "tenant" && !host.tenant) {
+        this.denyHost(principal, "host tenant is not bound", ["tenant"], name);
+      }
     }
 
     const amountCents = Number(args.amountCents ?? 0) || 0;
@@ -767,29 +608,15 @@ export class GovernedGateway {
       blocked: false,
       scoped: name.includes("."),
     });
-    if (chp.state === "REJECTED" && !usedApprovedLock) {
-      this.recordDecision({
-        decision: "deny",
-        tool: name,
-        argHash: digest,
-        principalId: principal.id,
-        policyVersion,
-        reason: "chp_rejected",
+    if (chp.state === "REJECTED") {
+      throw Object.assign(new Error(chp.rationale), {
+        rpc: { code: -32003, message: chp.rationale, data: chp },
       });
-      throw rpcError(-32003, chp.rationale, chp);
     }
-    if (!usedApprovedLock && chp.state !== "LOCKED" && name === "stripe.charge") {
-      const lock: PendingLock = {
-        id: newId("lck"),
-        principalId: principal.id,
-        tool: name,
-        argHash: digest,
-        policyVersion,
-        state: "pending",
-        createdAt: new Date().toISOString(),
-      };
-      this.locks.set(lock.id, lock);
-      throw rpcError(-32004, "pending_human", { ...chp, lockId: lock.id, argHash: digest });
+    if (chp.state !== "LOCKED" && name === "stripe.charge") {
+      throw Object.assign(new Error("CHP requires human lock before this tool"), {
+        rpc: { code: -32004, message: "pending_human", data: chp },
+      });
     }
 
     if (this.options.spendPlaneUrl && amountCents > 0) {
@@ -809,25 +636,19 @@ export class GovernedGateway {
       );
       const lane = asObject(hooked.json).lane;
       if (lane === "blocked") {
-        throw rpcError(-32005, "blocked by spend plane", hooked.json);
+        throw Object.assign(new Error("spend plane blocked"), {
+          rpc: { code: -32005, message: "blocked by spend plane", data: hooked.json },
+        });
       }
     }
 
     const impl = this.tools.get(name);
     if (!impl) throw new Error(`unknown tool ${name}`);
-    const result = impl(args, principal);
-    this.recordDecision({
-      decision: "allow",
-      tool: name,
-      argHash: digest,
-      principalId: principal.id,
-      policyVersion,
-      reason: usedApprovedLock ? "human_lock" : "allow",
-    });
+    const result = impl(args, principal, host);
     this.ledger.append({
       event: "tool.called",
       actor: principal.id,
-      inputs: { name, amountCents, argHash: digest },
+      inputs: { name, amountCents },
       sources: ["mcp", "chp"],
       rationale: chp.rationale,
     });
@@ -842,12 +663,11 @@ export class GovernedGateway {
       }
 
       if (req.method === "GET" && url.pathname === "/mcp/sse") {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
+        const principal = this.resolvePrincipal(req);
+        if (!principal) {
+          sendJson(res, 401, { error: "unauthorized" });
           return;
         }
-        const cubiczan = this.grantsFor(auth);
         const sse = openSse(res);
         this.seq += 1;
         const frame = {
@@ -856,7 +676,7 @@ export class GovernedGateway {
           params: {
             level: "info",
             message: "sse-open",
-            _meta: { cubiczan },
+            _meta: { cubiczan: { principal } },
           },
         };
         sse.send("message", frame, String(this.seq));
@@ -867,20 +687,27 @@ export class GovernedGateway {
       const obj = asObject(body);
 
       if (req.method === "GET" && url.pathname === "/v1/context/tax") {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
+        const principal = this.resolvePrincipal(req);
+        if (!principal) {
+          sendJson(res, 401, { error: "unauthorized" });
           return;
         }
         const sessionId = url.searchParams.get("session") ?? undefined;
-        sendJson(res, 200, this.contextTaxReport(auth.principal, sessionId));
+        try {
+          sendJson(res, 200, this.contextTaxReport(principal, sessionId));
+        } catch (error) {
+          const mismatch = error && typeof error === "object" && "code" in error && (error as { code: string }).code === "session_mismatch";
+          sendJson(res, mismatch ? 409 : 500, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         return;
       }
 
       if (req.method === "GET" && url.pathname === "/v1/context/packs") {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
+        const principal = this.resolvePrincipal(req);
+        if (!principal) {
+          sendJson(res, 401, { error: "unauthorized" });
           return;
         }
         const estate = this.estateReport();
@@ -894,23 +721,30 @@ export class GovernedGateway {
       }
 
       if (req.method === "POST" && url.pathname === "/v1/context/need") {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
+        const principal = this.resolvePrincipal(req);
+        if (!principal) {
+          sendJson(res, 401, { error: "unauthorized" });
           return;
         }
-        const sessionId = this.sessionIdFor(auth.principal, obj, req);
-        sendJson(res, 200, this.admitNeed(auth.principal, sessionId, {
-          tools: asStringArray(obj.tools),
-          pack: typeof obj.pack === "string" ? obj.pack : undefined,
-        }));
+        const sessionId = this.sessionIdFor(principal, obj, req);
+        try {
+          sendJson(res, 200, this.admitNeed(principal, sessionId, {
+            tools: asStringArray(obj.tools),
+            pack: typeof obj.pack === "string" ? obj.pack : undefined,
+          }));
+        } catch (error) {
+          const mismatch = error && typeof error === "object" && "code" in error && (error as { code: string }).code === "session_mismatch";
+          sendJson(res, mismatch ? 409 : 500, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/v1/credentials") {
-        const auth = this.authenticate(req);
-        if (!auth.ok || auth.principal.kind === "agent") {
-          sendJson(res, 401, { error: "operator required", reason: auth.ok ? "operator_required" : auth.reason });
+        const principal = this.resolvePrincipal(req);
+        if (!principal || principal.kind === "agent") {
+          sendJson(res, 401, { error: "operator required" });
           return;
         }
         const name = String(obj.name ?? "");
@@ -924,9 +758,9 @@ export class GovernedGateway {
       }
 
       if (req.method === "POST" && url.pathname.startsWith("/v1/credentials/") && url.pathname.endsWith("/rotate")) {
-        const auth = this.authenticate(req);
-        if (!auth.ok || auth.principal.kind === "agent") {
-          sendJson(res, 401, { error: "operator required", reason: auth.ok ? "operator_required" : auth.reason });
+        const principal = this.resolvePrincipal(req);
+        if (!principal || principal.kind === "agent") {
+          sendJson(res, 401, { error: "operator required" });
           return;
         }
         const name = url.pathname.split("/")[3];
@@ -947,23 +781,14 @@ export class GovernedGateway {
       }
 
       if (req.method === "POST" && (url.pathname === "/mcp" || url.pathname === "/")) {
+        const principal = this.resolvePrincipal(req);
+        if (!principal) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
         const method = String(obj.method ?? "");
         const id = obj.id ?? null;
-
         if (method === "initialize") {
-          const auth = this.authenticate(req);
-          if (!auth.ok) {
-            this.recordDecision({
-              decision: "deny",
-              tool: "",
-              argHash: "",
-              principalId: "anonymous",
-              policyVersion: 0,
-              reason: auth.reason,
-            });
-            sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
-            return;
-          }
           sendJson(res, 200, {
             jsonrpc: "2.0",
             id,
@@ -975,58 +800,71 @@ export class GovernedGateway {
           });
           return;
         }
-
         if (method === "tools/list") {
-          const auth = this.authenticate(req);
-          if (!auth.ok) {
-            this.recordDecision({
-              decision: "deny",
-              tool: "",
-              argHash: "",
-              principalId: "anonymous",
-              policyVersion: 0,
-              reason: auth.reason,
+          try {
+            sendJson(res, 200, {
+              jsonrpc: "2.0",
+              id,
+              result: this.listTools(principal, asObject(obj.params), req),
             });
-            sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
-            return;
+          } catch (error) {
+            const rpc = (error as { rpc?: { code: number; message: string; data?: unknown } }).rpc;
+            const mismatch = error && typeof error === "object" && "code" in error && (error as { code: string }).code === "session_mismatch";
+            sendJson(res, 200, {
+              jsonrpc: "2.0",
+              id,
+              error:
+                rpc ??
+                (mismatch
+                  ? { code: -32007, message: error instanceof Error ? error.message : "session mismatch" }
+                  : { code: -32000, message: error instanceof Error ? error.message : String(error) }),
+            });
           }
-          const grants = this.grantsFor(auth);
-          sendJson(res, 200, {
-            jsonrpc: "2.0",
-            id,
-            result: this.listTools(auth.principal, asObject(obj.params), req, grants),
-          });
           return;
         }
-
         if (method === "tools/call") {
-          const previewParams = asObject(obj.params);
-          const name = String(previewParams.name ?? "");
-          const auth = this.authenticate(req, isMetaTool(name) ? undefined : name || undefined);
-          if (!auth.ok) {
-            this.recordDecision({
-              decision: "deny",
-              tool: name,
-              argHash: argHash(asObject(previewParams.arguments)),
-              principalId: auth.principalId ?? "anonymous",
-              policyVersion: 0,
-              reason: auth.reason,
-            });
-            sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
-            return;
+          const paramsIn = asObject(obj.params);
+          const claimed = asObject(asObject(asObject(paramsIn._meta).cubiczan).principal);
+          const impersonation = claimedPrincipalConflict(principal, claimed);
+          if (impersonation) {
+            try {
+              this.denyHost(principal, impersonation, ["principal"], String(paramsIn.name ?? ""));
+            } catch (error) {
+              const rpc = (error as { rpc?: { code: number; message: string; data?: unknown } }).rpc;
+              sendJson(res, 200, {
+                jsonrpc: "2.0",
+                id,
+                error: rpc ?? { code: -32006, message: impersonation },
+              });
+              return;
+            }
           }
-          const grants = this.grantsFor(auth);
-          const attached = this.attachPrincipal(obj, auth.principal, grants);
+          const hostBound = this.hostBindingsFor(principal, paramsIn, req);
+          if (!hostBound.ok) {
+            try {
+              this.denyHost(principal, hostBound.reason, hostBound.invented, String(paramsIn.name ?? ""));
+            } catch (error) {
+              const rpc = (error as { rpc?: { code: number; message: string; data?: unknown } }).rpc;
+              sendJson(res, 200, {
+                jsonrpc: "2.0",
+                id,
+                error: rpc ?? { code: -32006, message: hostBound.reason },
+              });
+              return;
+            }
+          }
+          const attached = this.attachPrincipal(obj, principal, hostBound.host);
           const params = asObject(attached.params);
+          const name = String(params.name ?? "");
           const args = asObject(params.arguments);
           try {
-            const result = await this.dispatchTool(auth.principal, name, args, grants);
+            const result = await this.dispatchTool(principal, name, args, hostBound.host);
             sendJson(res, 200, {
               jsonrpc: "2.0",
               id,
               result: {
                 content: [{ type: "text", text: JSON.stringify(result) }],
-                _meta: { cubiczan: grants },
+                _meta: { cubiczan: { principal, host: hostBound.host } },
                 structuredContent: result,
               },
             });
@@ -1040,12 +878,6 @@ export class GovernedGateway {
           }
           return;
         }
-
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          sendJson(res, 401, { error: "unauthorized", reason: auth.reason });
-          return;
-        }
         sendJson(res, 200, {
           jsonrpc: "2.0",
           id,
@@ -1055,22 +887,13 @@ export class GovernedGateway {
       }
 
       if (req.method === "POST" && url.pathname === "/v1/locks") {
-        const auth = this.authenticate(req);
-        if (!auth.ok || auth.principal.kind === "agent") {
-          sendJson(res, 401, { error: "human required", reason: auth.ok ? "human_required" : auth.reason });
-          return;
-        }
-        const lockId = String(obj.lockId ?? "");
-        if (!lockId) {
-          sendJson(res, 400, { error: "lockId required" });
+        const principal = this.resolvePrincipal(req);
+        if (!principal || principal.kind === "agent") {
+          sendJson(res, 401, { error: "human required" });
           return;
         }
         const decision = obj.decision === "reject" ? "reject" : "approve";
-        try {
-          sendJson(res, 200, this.applyLock(lockId, decision, String(obj.notes ?? "")));
-        } catch (error) {
-          sendJson(res, 404, { error: error instanceof Error ? error.message : String(error) });
-        }
+        sendJson(res, 200, applyHumanLock(decision, String(obj.notes ?? "")));
         return;
       }
 

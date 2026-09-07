@@ -47,7 +47,9 @@ test("synthetic oversized fixture is flagged and dwarfs core tools", () => {
   const megaTax = measureToolSchema(mega, DEFAULT_TAX_THRESHOLDS.toolTokens);
   const echoTax = measureToolSchema(echo, DEFAULT_TAX_THRESHOLDS.toolTokens);
   assert.equal(megaTax.oversized, true);
+  assert.equal(megaTax.oversizedSchema, true);
   assert.equal(echoTax.oversized, false);
+  assert.ok(megaTax.schemaTokens > megaTax.descriptionTokens);
   assert.ok(megaTax.tokens / echoTax.tokens > 100, `ratio ${megaTax.tokens}/${echoTax.tokens}`);
 
   const estate = builtInCatalog().map((t) => measureToolSchema(t));
@@ -63,4 +65,14 @@ test("listed shape is name + description + inputSchema only", () => {
   const listed = toListedTool(mega);
   assert.deepEqual(Object.keys(listed).sort(), ["description", "inputSchema", "name"]);
   assert.equal(listed.name, "docs.mega_schema");
+});
+
+test("listed index.query schema strips host-only tenant and index", () => {
+  const tool = builtInCatalog().find((item) => item.name === "index.query");
+  assert.ok(tool);
+  const listed = toListedTool(tool);
+  const properties = (listed.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+  assert.deepEqual(Object.keys(properties).sort(), ["query"]);
+  assert.ok(!("tenant" in properties));
+  assert.ok(!("index" in properties));
 });
