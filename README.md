@@ -89,7 +89,7 @@ Glama can health-check a **stateless Streamable HTTP** remote at `https://$VERCE
 | Build Command | `npm run build` (esbuild → `dist/web.mjs`; do **not** run `tsc`) |
 | Output Directory | `public` (empty static dir for the Other preset; Fluid still serves `/api`) |
 
-`npm run build` runs `scripts/build-vercel.mjs` (esbuild). That emits `dist/web.mjs`. `api/index.mjs` imports that compiled file — it does **not** load TypeScript via runtime `tsx`. The Other preset still expects a static output folder after a custom `buildCommand`; `public/` is that folder (`outputDirectory: "public"`). If the Vercel dashboard still has a Build Command of `tsc`, clear it or set it to `npm run build` so TS5097 does not come back. Dashboard overrides are not required if `vercel.json` is honored.
+`npm run build` runs `scripts/build-vercel.mjs` (esbuild). That emits `dist/web.mjs`. `api/index.mjs` imports that compiled file — it does **not** load TypeScript via runtime `tsx`. Demo allowlist and oversized-schema seed are inlined in that bundle so Fluid does not open `test/fixtures/` (the function only includes `dist/**`). The Other preset still expects a static output folder after a custom `buildCommand`; `public/` is that folder (`outputDirectory: "public"`). If the Vercel dashboard still has a Build Command of `tsc`, clear it or set it to `npm run build` so TS5097 does not come back. Dashboard overrides are not required if `vercel.json` is honored.
 
 **Environment variables** (Vercel Project → Settings → Environment Variables). Rotate the demo values before a public URL:
 
