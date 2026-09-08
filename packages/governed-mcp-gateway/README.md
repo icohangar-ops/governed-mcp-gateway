@@ -89,7 +89,7 @@ Import this repository as a Vercel project:
 | Output Directory | `public` (empty; Other preset requires a static dir after `buildCommand`) |
 | Env | `GATEWAY_AGENT_KEY`, `GATEWAY_HUMAN_KEY`, `GATEWAY_RESEARCH_KEY` (rotate demo keys for a public URL) |
 
-`npm run build` emits `dist/web.mjs`. The Fluid `fetch` handler imports that compiled JS and calls `handleWebRequest`. Do not run TypeScript through runtime `tsx` on Vercel. `vercel.json` rewrites `/mcp`, `/health`, and `/healthz` to `/api`. Local `:7474` uses the same handler for those paths. `GET /mcp/sse` stays on the Node listener only.
+`npm run build` emits `dist/web.mjs`. The Fluid `fetch` handler imports that compiled JS and calls `handleWebRequest`. Do not run TypeScript through runtime `tsx` on Vercel. Demo seed (claim→tool allowlist and the oversized schema recipe) is **inlined in source** — the lambda does not open `test/fixtures/` (`includeFiles` is `dist/**`). `vercel.json` rewrites `/mcp`, `/health`, and `/healthz` to `/api`. Local `:7474` uses the same handler for those paths. `GET /mcp/sse` stays on the Node listener only.
 
 Local smoke:
 
@@ -170,15 +170,16 @@ curl -sS -H "Authorization: Bearer mcp_human_controller_demo" \
 
 ### Synthetic oversized fixture
 
-[`test/fixtures/oversized-schema.json`](test/fixtures/oversized-schema.json) is a compact recipe. The gateway expands it into `docs.mega_schema` on server `synthetic.oversized` so the inspector can show a three-order-of-magnitude gap versus `echo.ping`. Thresholds (defaults): tool 512 tokens, pack 1024, listed payload 2048. Ledger events: `schema.tax.recorded`, `schema.pack.opened`, `schema.pack.denied`, `schema.pack.flagged`.
+[`test/fixtures/oversized-schema.json`](test/fixtures/oversized-schema.json) documents the compact recipe; runtime uses the same object inlined in `src/tool-catalog.ts` (Fluid has no `test/` tree). The gateway expands it into `docs.mega_schema` on server `synthetic.oversized` so the inspector can show a three-order-of-magnitude gap versus `echo.ping`. Thresholds (defaults): tool 512 tokens, pack 1024, listed payload 2048. Ledger events: `schema.tax.recorded`, `schema.pack.opened`, `schema.pack.denied`, `schema.pack.flagged`.
 
 ## Layout
 
 ```
 packages/governed-mcp-gateway/src/gateway.ts       HTTP + JSON-RPC + SSE + vault
 packages/governed-mcp-gateway/src/web.ts           seeded handleWebRequest (Vercel / tests)
+packages/governed-mcp-gateway/src/claim-allowlist.ts  in-memory demo claim→tool seed
 packages/governed-mcp-gateway/src/token-tax.ts     bytes→token heuristic + report types
-packages/governed-mcp-gateway/src/tool-catalog.ts  packs + oversized fixture expansion
+packages/governed-mcp-gateway/src/tool-catalog.ts  packs + oversized recipe expansion
 packages/governed-mcp-gateway/src/context-pack.ts  session packs, allow-by-need
 scripts/build-vercel.mjs + dist/web.mjs            compiled Fluid handler (no runtime tsx)
 api/index.mjs + vercel.json                        Fluid Compute Streamable HTTP remote
