@@ -1,25 +1,22 @@
 # Governed MCP Gateway
 
+[![Cubiczan/governed-mcp-gateway MCP server — quality and maintenance score on Glama](https://glama.ai/mcp/servers/Cubiczan/governed-mcp-gateway/badges/score.svg)](https://glama.ai/mcp/servers/Cubiczan/governed-mcp-gateway)
+
 Port **7474**. Principal on every `tools/call` and every SSE frame.
 
 Production MCP is stuck on auth. `SecurityContextHolder` / ThreadLocal dies when the tool runs on an SSE worker. VS Code secrets are keyed by `inputs[].id`, so rotating a token by renaming the input leaves the old secret alive. This SKU is a **control plane**, not a server catalog.
-
-**Cookbook:** resolve Bearer at HTTP → stamp `params._meta.principal` (and scopes) → filter `tools/list` by claim→allowlist → re-check on `tools/call` → repeat principal on every SSE frame. Never ThreadLocal. Host binds tenant / index / vault on `_meta.cubiczan.host`. Full write-up: [Principal-on-RPC](../../docs/principal-on-rpc.md). Host-injected `_meta` / pack-by-need: [`host-injected-meta`](../../openspec/changes/host-injected-meta/). Parity notes: [Spring AI](../../docs/recipes/spring-ai.md), [Ballerina](../../docs/recipes/ballerina.md), [Python FastAPI](../../docs/recipes/python-fastapi.md).
 
 ![Platform: gateway sits in front of spend and CFO mesh](docs/screenshots/architecture.png)
 
 It:
 
-- Resolves a Bearer credential to a **Principal** (opaque API key or HS256 JWT)
-- Injects that principal into `params._meta.principal` / `params._meta.cubiczan.principal` on every `tools/call`
-- Binds **host-only** tenant / index / vaulted input names onto `_meta.cubiczan.host` — the model does not choose them
+- Resolves a Bearer credential to a **Principal**
+- Injects that principal into `params._meta.cubiczan.principal` on every `tools/call`
 - Repeats the principal on **every SSE event** so identity cannot drop with the handshake
-- Maps JWT `scope` → tools; effective catalog is **allowlist ∩ scope** (fail-closed)
 - Rotates vaulted MCP inputs in place (`github_token` stays `github_token`; the old hash stops verifying)
 - Enforces per-principal tool allowlists
-- Measures `tools/list` schema **token tax** (description vs `inputSchema`) and exposes a **pack / allow-by-need** catalog instead of dumping every schema every turn
+- Measures `tools/list` schema **token tax** and exposes a **pack / allow-by-need** catalog instead of dumping every schema every turn
 - Optionally hooks the spend-mandate plane before a priced tool runs
-- Makes Streamable HTTP **multi-replica** explicit: default **STATELESS**, or sticky / shared-store sessions — never silent in-process affinity
 
 ## Live behavior
 
@@ -38,6 +35,14 @@ npm install
 npm test -w @cubiczan/governed-mcp-gateway
 npm run gateway
 ```
+
+Stdio MCP (Glama / `npx`; NDJSON JSON-RPC on stdout, no HTTP port):
+
+```bash
+npm run mcp
+```
+
+Glama claim/build/release steps: [docs/glama-release.md](../../docs/glama-release.md).
 
 Or in this package:
 
@@ -68,13 +73,41 @@ curl -sS -H "Authorization: Bearer mcp_human_controller_demo" \
   http://127.0.0.1:7474/v1/credentials/github_token/rotate
 ```
 
+## Glama remote connector
+
+Hosted HTTPS is **stateless Streamable HTTP** (CodeSentinel Fluid Compute shape, Cubiczan brand). Glama health-checks `https://$VERCEL_URL/mcp` with Bearer auth. Do not hardcode a Vercel hostname.
+
+Import this repository as a Vercel project:
+
+| Setting | Value |
+|---|---|
+| Root Directory | `.` (repo root: `vercel.json` + `api/index.mjs`) |
+| Framework Preset | Other |
+| Fluid Compute | enabled |
+| Install Command | `npm ci && npm run build` (set in `vercel.json`) |
+| Build Command | `npm run build` (esbuild; do not use `tsc`) |
+| Env | `GATEWAY_AGENT_KEY`, `GATEWAY_HUMAN_KEY`, `GATEWAY_RESEARCH_KEY` (rotate demo keys for a public URL) |
+
+`npm run build` emits `dist/web.mjs`. The Fluid `fetch` handler imports that compiled JS and calls `handleWebRequest`. Do not run TypeScript through runtime `tsx` on Vercel. `vercel.json` rewrites `/mcp`, `/health`, and `/healthz` to `/api`. Local `:7474` uses the same handler for those paths. `GET /mcp/sse` stays on the Node listener only.
+
+Local smoke:
+
+```bash
+npm run mcp:http:smoke
+curl -sS http://127.0.0.1:7474/health
+curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  http://127.0.0.1:7474/mcp
+```
+
 ## API
 
 | Method | Path | Auth | What |
 |---|---|---|---|
-| `GET` | `/health` | — | `{ ok, service, sessionMode, replicaId }` |
-| `POST` | `/mcp` | Bearer agent or human | JSON-RPC `initialize`, `tools/list`, `tools/call` |
-| `DELETE` | `/mcp` | Bearer | Close a sticky/shared `Mcp-Session-Id` |
+| `GET` | `/health` `/healthz` | — | `{ ok, service, transport, mode }` |
+| `POST` | `/mcp` | Bearer agent or human | Streamable HTTP JSON-RPC `initialize`, `tools/list`, `tools/call` |
 | `GET` | `/mcp/sse` | Bearer | `notifications/message` with principal on `_meta` |
 | `GET` | `/v1/context/tax` | Bearer | Schema token-tax ledger / estate report |
 | `GET` | `/v1/context/packs` | Bearer | Named packs and per-server cost |
@@ -84,7 +117,7 @@ curl -sS -H "Authorization: Bearer mcp_human_controller_demo" \
 | `POST` | `/v1/credentials/verify` | — | `{ ok: boolean }` |
 | `POST` | `/v1/locks` | Human | CHP approve / reject |
 
-Demo keys: `mcp_agt_payops_demo` (PayOps: `echo.ping`, `stripe.charge`, `index.query`), `mcp_agt_research_demo` (no charge tool), `mcp_human_controller_demo` (vault + locks).
+Demo keys: `mcp_agt_payops_demo` (PayOps: `echo.ping`, `stripe.charge`), `mcp_agt_research_demo` (no charge tool), `mcp_human_controller_demo` (vault + locks).
 
 Disallowed tools return JSON-RPC `-32001` — they do not run.
 
@@ -94,7 +127,7 @@ MCP clients hide how expensive `tools/list` is. Measured schema cost can vary ~1
 
 **Heuristic:** `tokens = ceil(utf8_bytes / 4)`. Bytes are always recorded so the divisor is replaceable. No live tokenizer.
 
-**Default `tools/list`** returns the session pack only: catalog meta-tools (`context.inspect`, `context.need`) plus allowlisted `core` tools (`echo.ping`). PayOps does **not** receive `stripe.charge` or `index.query` until it asks. The result `_meta.cubiczan.tax` has `bytes`, `tokens`, `savedTokens`, `flagged`, and `warnings`. Estate rows also split `descriptionTokens` vs `schemaTokens`.
+**Default `tools/list`** returns the session pack only: catalog meta-tools (`context.inspect`, `context.need`) plus allowlisted `core` tools (`echo.ping`). PayOps does **not** receive `stripe.charge` until it asks. The result `_meta.cubiczan.tax` has `bytes`, `tokens`, `savedTokens`, `flagged`, and `warnings`.
 
 **Allow-by-need** admits extra tools into the session, always intersected with the principal allowlist (fail-closed). Session id is `X-Cubiczan-Session`, `params.sessionId`, or `params._meta.cubiczan.sessionId` (default `ses_<principalId>`).
 
@@ -132,154 +165,26 @@ curl -sS -H "Authorization: Bearer mcp_human_controller_demo" \
 | `core` | `echo.ping` | yes if allowlisted |
 | `payments` | `stripe.charge` | need / `pack=payments` / `mode=full` |
 | `research` | `search.web` | need / `pack=research` / `mode=full` |
-| `tenant` | `index.query` | need / `pack=tenant` / `mode=full` (host binds tenant + index) |
 | `bloat` | `docs.mega_schema` | never on demo allowlists |
-
-## Cookbook
-
-Clients want a subset of tools without forking the server. Hosts need tenant, index, and vaulted keys without the LLM choosing them. Fail-closed auth is unchanged: missing Bearer is HTTP 401.
-
-### 1. Default `tools/list` is a session pack
-
-```bash
-curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-  http://127.0.0.1:7474/mcp
-```
-
-Expect `echo.ping`, `context.inspect`, `context.need`. Do **not** expect `stripe.charge` or `index.query`. `_meta.cubiczan.tax.mode` is `pack` and `savedTokens > 0`.
-
-### 2. Allow-by-need (allowlist is the ceiling)
-
-```bash
-# PayOps may admit the payments pack
-curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"pack":"payments"}}' \
-  http://127.0.0.1:7474/mcp
-
-# Same via HTTP
-curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
-  -H "X-Cubiczan-Session: ses_payops_need" \
-  -H "Content-Type: application/json" \
-  -d '{"tools":["stripe.charge"]}' \
-  http://127.0.0.1:7474/v1/context/need
-
-# Research cannot need stripe.charge — denied + schema.pack.denied
-curl -sS -H "Authorization: Bearer mcp_agt_research_demo" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"need":["stripe.charge"]}}' \
-  http://127.0.0.1:7474/mcp
-```
-
-`params.mode=full` dumps every **allowlisted** schema (legacy). It still omits `docs.mega_schema`.
-
-### 3. Estate token-tax report
-
-```bash
-curl -sS -H "Authorization: Bearer mcp_human_controller_demo" \
-  http://127.0.0.1:7474/v1/context/tax
-```
-
-`estate.tools[]` has `bytes`, `tokens`, `descriptionTokens`, `schemaTokens`, `oversized`, `oversizedSchema`. Pack `bloat` and `docs.mega_schema` are flagged. Unauthenticated GET is **401**.
-
-### 4. Host-injected `_meta` (tenant / index / vault)
-
-The LLM fills `arguments`. The host binds the rest. `index.query` lists only `{ query }` — tenant and index are stripped from the schema.
-
-```bash
-# Bind index at the host. Tenant is always principal.orgId (org_acme).
-curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
-  -H "X-Cubiczan-Index: kb_prod" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"index.query","arguments":{"query":"leases"}}}' \
-  http://127.0.0.1:7474/mcp
-```
-
-Equivalent host `_meta` (not arguments):
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 4,
-  "method": "tools/call",
-  "params": {
-    "name": "index.query",
-    "arguments": { "query": "leases" },
-    "_meta": { "cubiczan": { "host": { "index": "kb_prod" } } }
-  }
-}
-```
-
-The result `_meta.cubiczan.host` repeats `{ tenant, index, vault.github_token: { name, version } }`. No secret.
-
-### 5. Negative: model invents host-only identifiers
-
-These return JSON-RPC `-32006` and ledger `host.meta.denied`. The tool does not run.
-
-```bash
-# Invented tenant
-curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"index.query","arguments":{"query":"x","tenant":"org_other"}}}' \
-  http://127.0.0.1:7474/mcp
-
-# Invented vaulted input
-curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"echo.ping","arguments":{"hello":"world","github_token":"ghp_stolen"}}}' \
-  http://127.0.0.1:7474/mcp
-
-# Tenant header that is not the principal org
-curl -sS -H "Authorization: Bearer mcp_agt_payops_demo" \
-  -H "X-Cubiczan-Tenant: org_other" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo.ping","arguments":{"hello":"world"}}}' \
-  http://127.0.0.1:7474/mcp
-```
-
-Also denied: `_meta.cubiczan.principal.id` impersonation, conflicting header vs `_meta` index claims, `index.query` with no host-bound index.
-
-### 6. Vaulted inputs
-
-VS Code `inputs[].id` stays `github_token`. Rotate in place; the old hash dies. The name is host-injected metadata, never a tool argument.
-
-```bash
-curl -sS -H "Authorization: Bearer mcp_human_controller_demo" \
-  -H "Content-Type: application/json" \
-  -d '{"secret":"ghp_new_secret_bbbb"}' \
-  http://127.0.0.1:7474/v1/credentials/github_token/rotate
-```
 
 ### Synthetic oversized fixture
 
 [`test/fixtures/oversized-schema.json`](test/fixtures/oversized-schema.json) is a compact recipe. The gateway expands it into `docs.mega_schema` on server `synthetic.oversized` so the inspector can show a three-order-of-magnitude gap versus `echo.ping`. Thresholds (defaults): tool 512 tokens, pack 1024, listed payload 2048. Ledger events: `schema.tax.recorded`, `schema.pack.opened`, `schema.pack.denied`, `schema.pack.flagged`.
 
-### Claim→allowlist fixtures
-
-[`test/fixtures/claim-allowlist.json`](test/fixtures/claim-allowlist.json) is the JWT profile: audience `mcp://governed-gateway`, HS256 demo HMAC, and `scope` → tool mappings. Tests mint tokens locally (`mintFixtureJwt`). Fail-closed cases: missing / invalid / expired / wrong-`aud` Bearer → HTTP 401. Guessed names and allowlist∩scope misses → JSON-RPC `-32001`. Opaque demo keys still use the registered allowlist when `scopes` is absent. See the [Principal-on-RPC cookbook](../../docs/principal-on-rpc.md). Host-injected `_meta` / pack-by-need: [`host-injected-meta`](../../openspec/changes/host-injected-meta/).
-
 ## Layout
 
 ```
-packages/governed-mcp-gateway/src/gateway.ts           HTTP + JSON-RPC + SSE + vault
-packages/governed-mcp-gateway/src/claim-allowlist.ts   JWT Bearer + scope ∩ allowlist
-packages/governed-mcp-gateway/src/host-meta.ts         host-only bind / strip / deny
-packages/governed-mcp-gateway/src/token-tax.ts         bytes→token heuristic + description/schema split
-packages/governed-mcp-gateway/src/tool-catalog.ts      packs + oversized fixture expansion
-packages/governed-mcp-gateway/src/context-pack.ts      session packs, allow-by-need
-packages/governed-mcp-gateway/test/fixtures/           oversized schema + claim→allowlist
-packages/shared                                        CHP gate, HMAC JWT, ledger, SSE helper
+packages/governed-mcp-gateway/src/gateway.ts       HTTP + JSON-RPC + SSE + vault
+packages/governed-mcp-gateway/src/web.ts           seeded handleWebRequest (Vercel / tests)
+packages/governed-mcp-gateway/src/token-tax.ts     bytes→token heuristic + report types
+packages/governed-mcp-gateway/src/tool-catalog.ts  packs + oversized fixture expansion
+packages/governed-mcp-gateway/src/context-pack.ts  session packs, allow-by-need
+scripts/build-vercel.mjs + dist/web.mjs            compiled Fluid handler (no runtime tsx)
+api/index.mjs + vercel.json                        Fluid Compute Streamable HTTP remote
+packages/shared                                    CHP gate, HMAC ledger, SSE helper
 ```
-```
 
-Sister SKUs: [spend-mandate-plane](https://github.com/icohangar-ops/spend-mandate-plane) (`:7475`), [cfo-agent-mesh](https://github.com/icohangar-ops/cfo-agent-mesh) (`:7476`).
-
-
-## Streamable HTTP multi-replica
-
-Default `MCP_SESSION_MODE=stateless`. Sticky and shared-store modes mint `Mcp-Session-Id` on `initialize` and fail closed on unknown / mismatched sessions. Runbook: [`docs/streamable-http-multi-replica.md`](../../docs/streamable-http-multi-replica.md). OpenSpec: [`streamable-http-multi-replica`](../../openspec/changes/streamable-http-multi-replica/).
+Sister SKUs in this workspace: [spend-mandate-plane](../spend-mandate-plane) (`:7475`), [cfo-agent-mesh](../cfo-agent-mesh) (`:7476`). Listing: [Cubiczan/governed-mcp-gateway](https://github.com/Cubiczan/governed-mcp-gateway).
 
 ## License
 

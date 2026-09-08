@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -151,11 +152,21 @@ test("Node listener delegates /health and Bearer /mcp", async () => {
   }
 });
 
+function buildVercelBundle(): string {
+  execFileSync(process.execPath, [join(repoRoot(), "scripts/build-vercel.mjs")], {
+    cwd: repoRoot(),
+    stdio: "pipe",
+  });
+  return join(repoRoot(), "dist/web.mjs");
+}
+
 test("vercel.json and api/index.mjs follow Fluid Compute shape without a hostname", () => {
   const vercel = JSON.parse(readRepo("vercel.json")) as {
     fluid?: boolean;
+    installCommand?: string;
+    buildCommand?: string | null;
     rewrites?: Array<{ source: string; destination: string }>;
-    functions?: Record<string, unknown>;
+    functions?: Record<string, { includeFiles?: string }>;
   };
   assert.equal(vercel.fluid, true);
   const sources = new Set((vercel.rewrites ?? []).map((r) => r.source));
@@ -164,19 +175,32 @@ test("vercel.json and api/index.mjs follow Fluid Compute shape without a hostnam
   assert.ok(sources.has("/healthz"));
   assert.ok((vercel.rewrites ?? []).every((r) => r.destination === "/api"));
   assert.ok(vercel.functions && "api/index.mjs" in vercel.functions);
+  assert.match(vercel.installCommand ?? "", /npm run build/);
+  assert.match(vercel.buildCommand ?? "", /npm run build/);
+  assert.doesNotMatch(vercel.buildCommand ?? "", /\btsc\b/);
+  assert.match(vercel.functions["api/index.mjs"]?.includeFiles ?? "", /dist\/\*\*/);
 
   const entry = readRepo("api/index.mjs");
   assert.match(entry, /handleWebRequest/);
   assert.match(entry, /async fetch\(request\)/);
+  assert.match(entry, /dist\/web\.mjs/);
   assert.match(entry, /\$VERCEL_URL/);
+  assert.doesNotMatch(entry, /import\s+["']tsx["']/);
+  assert.doesNotMatch(entry, /from\s+["'][^"']+\.ts["']/);
   assert.doesNotMatch(entry, /\.vercel\.app/);
   assert.doesNotMatch(readRepo("vercel.json"), /\.vercel\.app/);
   assert.doesNotMatch(readRepo("README.md"), /\.vercel\.app/);
 });
 
 test("Fluid fetch entry serves /health and Bearer initialize", async () => {
+  const bundle = buildVercelBundle();
+  const bundled = readFileSync(bundle, "utf8");
+  assert.doesNotMatch(bundled, /from\s+["']tsx["']/);
+  assert.doesNotMatch(bundled, /import\s+["']tsx["']/);
+  execFileSync(process.execPath, ["--check", bundle], { cwd: repoRoot() });
+
   resetSeededWebGateway();
-  const mod = (await import(join(repoRoot(), "api/index.mjs"))) as {
+  const mod = (await import(`${join(repoRoot(), "api/index.mjs")}?built=${Date.now()}`)) as {
     default: { fetch: (request: Request) => Promise<Response> };
   };
   const health = await mod.default.fetch(new Request("http://127.0.0.1/health"));

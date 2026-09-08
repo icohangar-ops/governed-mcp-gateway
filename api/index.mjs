@@ -8,13 +8,11 @@
  * Public URL after deploy: https://$VERCEL_URL/mcp
  * (do not hardcode a hostname in this repo).
  *
- * Load tsx via side-effect import (Node 22 rejects register("tsx/esm") /
- * --loader). Then import the TypeScript workspace graph.
+ * Import compiled JS from `dist/` (`npm run build`). Do not load TypeScript
+ * via runtime tsx — Fluid/Node cannot ship tsx's CJS helper.
  */
 
-import "tsx";
-
-const { handleWebRequest } = await import("../packages/governed-mcp-gateway/src/web.ts");
+import { handleWebRequest } from "../dist/web.mjs";
 
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
