@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -165,10 +165,13 @@ test("vercel.json and api/index.mjs follow Fluid Compute shape without a hostnam
     fluid?: boolean;
     installCommand?: string;
     buildCommand?: string | null;
+    outputDirectory?: string | null;
     rewrites?: Array<{ source: string; destination: string }>;
     functions?: Record<string, { includeFiles?: string }>;
   };
   assert.equal(vercel.fluid, true);
+  assert.equal(vercel.outputDirectory, "public");
+  assert.ok(existsSync(join(repoRoot(), "public")));
   const sources = new Set((vercel.rewrites ?? []).map((r) => r.source));
   assert.ok(sources.has("/mcp"));
   assert.ok(sources.has("/health"));
