@@ -10,18 +10,27 @@
     "packages/cfo-agent-mesh"
   ],
   "scripts": {
+    "build": "node scripts/build-vercel.mjs",
+    "build:vercel": "node scripts/build-vercel.mjs",
     "test": "npm test --workspaces --if-present",
     "gateway": "npm start -w @cubiczan/governed-mcp-gateway",
+    "mcp": "npm run mcp -w @cubiczan/governed-mcp-gateway",
+    "mcp:http:smoke": "node --import tsx scripts/mcp-http-smoke.ts",
     "spend": "npm start -w @cubiczan/spend-mandate-plane",
     "cfo": "npm start -w @cubiczan/cfo-agent-mesh",
-    "shots": "node --import tsx scripts/capture-live.ts && python3 scripts/render-readme-shots.py",
-    "mcp:http:smoke": "node --import tsx scripts/mcp-http-smoke.ts"
+    "shots": "node --import tsx scripts/capture-live.ts && python3 scripts/render-readme-shots.py"
   },
+  "dependencies": {
+    "esbuild": "^0.25.9",
+    "tsx": "^4.19.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Cubiczan/governed-mcp-gateway.git"
+  },
+  "homepage": "https://github.com/Cubiczan/governed-mcp-gateway#readme",
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT",
-  "dependencies": {
-    "tsx": "^4.19.3"
-  }
+  "license": "MIT"
 }
