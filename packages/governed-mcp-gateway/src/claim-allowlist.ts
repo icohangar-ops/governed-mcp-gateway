@@ -1,27 +1,15 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import {
-  parseScopeClaim,
-  signHs256Jwt,
-  verifyHs256Jwt,
-  type JwtClaims,
-  type JwtFailReason,
-  type Principal,
-} from "@cubiczan/shared";
+/**
+ * In-memory claim → tool allowlist seed for the demo gateway.
+ *
+ * Do not read `test/fixtures/claim-allowlist.json` at runtime. After esbuild
+ * emits `dist/web.mjs`, `import.meta.url` is the bundle (`/var/task/dist/…`)
+ * so a relative `../test/fixtures/…` path becomes `/var/task/test/fixtures/…`,
+ * which Fluid does not ship (`includeFiles` is `dist/**`).
+ */
 
 export interface ScopeToolMapping {
   scope: string;
   tools: string[];
-}
-
-export interface ClaimAllowlistFixture {
-  audience: string;
-  issuer: string;
-  hmacSecret: string;
-  algorithm: "HS256";
-  mappings: ScopeToolMapping[];
-  cases: Record<string, ClaimTokenRecipe>;
 }
 
 export interface ClaimTokenRecipe {
@@ -34,16 +22,74 @@ export interface ClaimTokenRecipe {
   call?: string;
 }
 
-export type BearerFailReason = "missing" | JwtFailReason;
+export interface ClaimAllowlistSeed {
+  audience: string;
+  issuer: string;
+  hmacSecret: string;
+  algorithm: "HS256";
+  mappings: ScopeToolMapping[];
+  cases: Record<string, ClaimTokenRecipe>;
+}
 
-export type BearerAuthResult =
-  | { ok: true; principal: Principal; source: "api-key" | "jwt" }
-  | { ok: false; reason: BearerFailReason };
+export const DEFAULT_CLAIM_ALLOWLIST: ClaimAllowlistSeed = {
+  audience: "mcp://governed-gateway",
+  issuer: "https://issuer.cubiczan.test",
+  hmacSecret: "gateway-jwt-demo-hmac",
+  algorithm: "HS256",
+  mappings: [
+    { scope: "tools:echo", tools: ["echo.ping"] },
+    { scope: "tools:payments", tools: ["stripe.charge"] },
+    { scope: "tools:search", tools: ["search.web"] },
+  ],
+  cases: {
+    validPayops: {
+      sub: "agt_payops",
+      scope: "tools:echo tools:payments",
+      expOffsetSec: 3600,
+    },
+    echoOnly: {
+      sub: "agt_payops",
+      scope: "tools:echo",
+      expOffsetSec: 3600,
+    },
+    expired: {
+      sub: "agt_payops",
+      scope: "tools:echo",
+      expOffsetSec: -60,
+    },
+    wrongAud: {
+      sub: "agt_payops",
+      aud: "mcp://other-gateway",
+      scope: "tools:echo",
+      expOffsetSec: 3600,
+    },
+    guessedTool: {
+      sub: "agt_payops",
+      scope: "tools:echo",
+      expOffsetSec: 3600,
+      call: "vault.exfil",
+    },
+    intersectDeny: {
+      sub: "agt_payops",
+      scope: "tools:echo",
+      expOffsetSec: 3600,
+      call: "stripe.charge",
+    },
+    intersectAllow: {
+      sub: "agt_payops",
+      scope: "tools:echo tools:payments",
+      expOffsetSec: 3600,
+      call: "echo.ping",
+    },
+  },
+};
 
-export function loadClaimAllowlistFixture(): ClaimAllowlistFixture {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const path = join(here, "../test/fixtures/claim-allowlist.json");
-  return JSON.parse(readFileSync(path, "utf8")) as ClaimAllowlistFixture;
+export function defaultClaimAllowlist(): ClaimAllowlistSeed {
+  return structuredClone(DEFAULT_CLAIM_ALLOWLIST);
+}
+
+export function loadClaimAllowlistFixture(): ClaimAllowlistSeed {
+  return defaultClaimAllowlist();
 }
 
 export function toolsForScopes(scopes: string[], mappings: ScopeToolMapping[]): string[] {
@@ -62,50 +108,9 @@ export function intersectAllowlist(allowlist: string[], scoped: string[]): strin
 
 export function effectiveAllowlist(
   registered: string[],
-  principal: Principal,
+  scopes: string[] | undefined,
   mappings: ScopeToolMapping[],
 ): string[] {
-  if (principal.scopes === undefined) return registered;
-  return intersectAllowlist(registered, toolsForScopes(principal.scopes, mappings));
-}
-
-export function mintFixtureJwt(
-  fixture: ClaimAllowlistFixture,
-  recipe: ClaimTokenRecipe,
-  nowMs = Date.now(),
-): string {
-  const nowSec = Math.floor(nowMs / 1000);
-  const claims: JwtClaims = {
-    sub: recipe.sub,
-    aud: recipe.aud ?? fixture.audience,
-    iss: recipe.iss ?? fixture.issuer,
-    iat: nowSec,
-    exp: nowSec + (recipe.expOffsetSec ?? 3600),
-    scope: recipe.scope ?? "",
-  };
-  if (recipe.nbfOffsetSec !== undefined) claims.nbf = nowSec + recipe.nbfOffsetSec;
-  return signHs256Jwt(claims, fixture.hmacSecret);
-}
-
-export function verifyFixtureJwt(
-  token: string,
-  fixture: ClaimAllowlistFixture,
-  now?: () => number,
-): { ok: true; claims: JwtClaims } | { ok: false; reason: JwtFailReason } {
-  return verifyHs256Jwt(token, {
-    secret: fixture.hmacSecret,
-    audience: fixture.audience,
-    issuer: fixture.issuer,
-    now,
-  });
-}
-
-export function principalFromJwtClaims(
-  base: Principal,
-  claims: JwtClaims,
-): Principal {
-  return {
-    ...base,
-    scopes: parseScopeClaim(claims.scope),
-  };
+  if (scopes === undefined) return registered;
+  return intersectAllowlist(registered, toolsForScopes(scopes, mappings));
 }
