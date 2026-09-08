@@ -87,8 +87,9 @@ Glama can health-check a **stateless Streamable HTTP** remote at `https://$VERCE
 | Node.js | 20 or later |
 | Install Command | `npm ci && npm run build` (`vercel.json` already sets this) |
 | Build Command | `npm run build` (esbuild → `dist/web.mjs`; do **not** run `tsc`) |
+| Output Directory | `public` (empty static dir for the Other preset; Fluid still serves `/api`) |
 
-`npm run build` runs `scripts/build-vercel.mjs` (esbuild). That emits `dist/web.mjs`. `api/index.mjs` imports that compiled file — it does **not** load TypeScript via runtime `tsx`. If the Vercel dashboard still has a Build Command of `tsc`, clear it or set it to `npm run build` so TS5097 does not come back. Dashboard overrides are not required if `vercel.json` is honored.
+`npm run build` runs `scripts/build-vercel.mjs` (esbuild). That emits `dist/web.mjs`. `api/index.mjs` imports that compiled file — it does **not** load TypeScript via runtime `tsx`. The Other preset still expects a static output folder after a custom `buildCommand`; `public/` is that folder (`outputDirectory: "public"`). If the Vercel dashboard still has a Build Command of `tsc`, clear it or set it to `npm run build` so TS5097 does not come back. Dashboard overrides are not required if `vercel.json` is honored.
 
 **Environment variables** (Vercel Project → Settings → Environment Variables). Rotate the demo values before a public URL:
 
@@ -176,7 +177,7 @@ curl -sS -H "Authorization: Bearer cfo_agt_lease_demo" \
 
 ## Specs
 
-OpenSpec changes: [`ship-three-sku-platform`](openspec/changes/ship-three-sku-platform/), [`tools-list-token-tax`](openspec/changes/tools-list-token-tax/), [`glama-streamable-http-remote`](openspec/changes/glama-streamable-http-remote/), [`vercel-compiled-fluid-entry`](openspec/changes/vercel-compiled-fluid-entry/).
+OpenSpec changes: [`ship-three-sku-platform`](openspec/changes/ship-three-sku-platform/), [`tools-list-token-tax`](openspec/changes/tools-list-token-tax/), [`glama-streamable-http-remote`](openspec/changes/glama-streamable-http-remote/), [`vercel-compiled-fluid-entry`](openspec/changes/vercel-compiled-fluid-entry/), [`vercel-public-output-directory`](openspec/changes/vercel-public-output-directory/).
 
 ## License
 
