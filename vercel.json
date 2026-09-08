@@ -4,6 +4,7 @@
   "fluid": true,
   "installCommand": "npm ci && npm run build",
   "buildCommand": "npm run build",
+  "outputDirectory": "public",
   "rewrites": [
     { "source": "/mcp", "destination": "/api" },
     { "source": "/health", "destination": "/api" },
