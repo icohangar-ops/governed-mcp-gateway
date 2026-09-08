@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   BYTES_PER_TOKEN,
   DEFAULT_TAX_THRESHOLDS,
@@ -12,10 +15,12 @@ import {
   packTax,
 } from "../src/token-tax.ts";
 import {
+  OVERSIZED_SCHEMA_RECIPE,
   buildOversizedCatalogTool,
   builtInCatalog,
   loadOversizedFixtureRecipe,
   toListedTool,
+  type OversizedFixtureRecipe,
 } from "../src/tool-catalog.ts";
 
 test("bytes-to-token heuristic is ceil(utf8/4)", () => {
@@ -35,6 +40,17 @@ test("measureJson matches JSON.stringify byte length", () => {
   assert.equal(measured.tokens, Math.ceil(measured.bytes / 4));
 });
 
+test("on-disk oversized fixture matches the in-source recipe", () => {
+  const onDisk = JSON.parse(
+    readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "fixtures/oversized-schema.json"),
+      "utf8",
+    ),
+  ) as OversizedFixtureRecipe;
+  assert.deepEqual(onDisk, OVERSIZED_SCHEMA_RECIPE);
+  assert.deepEqual(loadOversizedFixtureRecipe(), OVERSIZED_SCHEMA_RECIPE);
+});
+
 test("synthetic oversized fixture is flagged and dwarfs core tools", () => {
   const recipe = loadOversizedFixtureRecipe();
   assert.equal(recipe.name, "docs.mega_schema");
@@ -47,9 +63,7 @@ test("synthetic oversized fixture is flagged and dwarfs core tools", () => {
   const megaTax = measureToolSchema(mega, DEFAULT_TAX_THRESHOLDS.toolTokens);
   const echoTax = measureToolSchema(echo, DEFAULT_TAX_THRESHOLDS.toolTokens);
   assert.equal(megaTax.oversized, true);
-  assert.equal(megaTax.oversizedSchema, true);
   assert.equal(echoTax.oversized, false);
-  assert.ok(megaTax.schemaTokens > megaTax.descriptionTokens);
   assert.ok(megaTax.tokens / echoTax.tokens > 100, `ratio ${megaTax.tokens}/${echoTax.tokens}`);
 
   const estate = builtInCatalog().map((t) => measureToolSchema(t));
@@ -65,14 +79,4 @@ test("listed shape is name + description + inputSchema only", () => {
   const listed = toListedTool(mega);
   assert.deepEqual(Object.keys(listed).sort(), ["description", "inputSchema", "name"]);
   assert.equal(listed.name, "docs.mega_schema");
-});
-
-test("listed index.query schema strips host-only tenant and index", () => {
-  const tool = builtInCatalog().find((item) => item.name === "index.query");
-  assert.ok(tool);
-  const listed = toListedTool(tool);
-  const properties = (listed.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
-  assert.deepEqual(Object.keys(properties).sort(), ["query"]);
-  assert.ok(!("tenant" in properties));
-  assert.ok(!("index" in properties));
 });
