@@ -11,7 +11,7 @@ Repo files this listing needs:
 | [`glama.json`](../glama.json) | Claim file. Schema is only `maintainers` (GitHub usernames). Pattern matches Cubiczan/chp-mcp (`icohangar-ops`) plus `Cubiczan`. |
 | [`Dockerfile`](../Dockerfile) | Local/self-host image. Glama often **generates** its own image; still keep this file so admin can paste CMD/build steps. |
 | `packages/governed-mcp-gateway/src/mcp.ts` | Stdio JSON-RPC entry. Glama wraps CMD with `mcp-proxy --`. |
-| `api/index.mjs` + `vercel.json` + `dist/web.mjs` | Optional **remote connector** (stateless Streamable HTTP on Vercel Fluid Compute). Install is `npm ci && npm run build`; the Fluid entry imports compiled JS, not runtime `tsx`. `outputDirectory` is `public/` (empty static dir for the Other preset). Glama health-checks `https://$VERCEL_URL/mcp` with Bearer auth. Not a substitute for the stdio Dockerfile build. |
+| `api/index.mjs` + `vercel.json` + `dist/web.mjs` | Optional **remote connector** (stateless Streamable HTTP on Vercel Fluid Compute). Install is `npm ci && npm run build`; the Fluid entry imports compiled JS, not runtime `tsx`. `outputDirectory` is `public/` (empty static dir for the Other preset). Demo seed is inlined — the function does not open `test/fixtures/`. Glama health-checks `https://$VERCEL_URL/mcp` with Bearer auth. Not a substitute for the stdio Dockerfile build. |
 | `packages/governed-mcp-gateway/package.json` | `repository` is `https://github.com/Cubiczan/governed-mcp-gateway`. |
 
 Cubiczan-only URLs. Do not use icohangar-ops GitHub URLs on this listing.

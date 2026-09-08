@@ -200,6 +200,9 @@ test("Fluid fetch entry serves /health and Bearer initialize", async () => {
   const bundled = readFileSync(bundle, "utf8");
   assert.doesNotMatch(bundled, /from\s+["']tsx["']/);
   assert.doesNotMatch(bundled, /import\s+["']tsx["']/);
+  assert.doesNotMatch(bundled, /test\/fixtures\/claim-allowlist\.json/);
+  assert.doesNotMatch(bundled, /test\/fixtures\/oversized-schema\.json/);
+  assert.doesNotMatch(bundled, /readFileSync/);
   execFileSync(process.execPath, ["--check", bundle], { cwd: repoRoot() });
 
   resetSeededWebGateway();

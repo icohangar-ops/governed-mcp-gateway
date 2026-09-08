@@ -17,34 +17,7 @@ import {
 } from "@cubiczan/shared";
 import type http from "node:http";
 import type { Json } from "@cubiczan/shared";
-import {
-  effectiveAllowlist,
-  loadClaimAllowlistFixture,
-  principalFromJwtClaims,
-  verifyFixtureJwt,
-  type BearerAuthResult,
-  type ClaimAllowlistFixture,
-} from "./claim-allowlist.ts";
 import { ContextPackStore, resolveSessionId, type AdmitResult } from "./context-pack.ts";
-import {
-  SESSION_RPC_CODE,
-  defaultReplicaId,
-  parseSessionMode,
-  requiresTransportSession,
-  sessionDenied,
-  InMemorySessionStore,
-  type SessionDenied,
-  type SessionMode,
-  type SessionStore,
-} from "./session-store.ts";
-import {
-  bindHostBindings,
-  claimedPrincipalConflict,
-  inventedHostKeys,
-  stripHostOnlyKeys,
-  type HostBindResult,
-  type HostBindings,
-} from "./host-meta.ts";
 import {
   DEFAULT_TAX_THRESHOLDS,
   groupByServer,
@@ -59,9 +32,13 @@ import {
   type ToolTax,
 } from "./token-tax.ts";
 import {
+  defaultClaimAllowlist,
+  toolsForScopes,
+  type ClaimAllowlistSeed,
+} from "./claim-allowlist.ts";
+import {
   builtInCatalog,
   canExpose,
-  defaultSeedTools,
   toListedTool,
   type CatalogTool,
   type ToolImpl,
@@ -88,12 +65,24 @@ export interface GatewayOptions {
   spendPlaneUrl?: string;
   auditKey?: string;
   taxThresholds?: Partial<TaxThresholds>;
-  jwtNow?: () => number;
-  claimFixture?: ClaimAllowlistFixture;
-  sessionMode?: SessionMode;
-  replicaId?: string;
-  sessionStore?: SessionStore;
+  claimFixture?: ClaimAllowlistSeed;
 }
+
+export interface JsonRpcError {
+  code: number;
+  message: string;
+  data?: unknown;
+}
+
+export interface JsonRpcResponse {
+  jsonrpc: "2.0";
+  id: Json;
+  result?: unknown;
+  error?: JsonRpcError;
+}
+
+export const MCP_INSTRUCTIONS =
+  "Governed MCP Gateway. Every tools/call carries params._meta.cubiczan.principal from the authenticated credential. Default tools/list is the session pack (echo.ping plus catalog meta-tools context.inspect and context.need), not the full allowlist. Call context.inspect to read schema token tax; call context.need to admit allowlisted tools (pack=payments for stripe.charge). Disallowed tools return JSON-RPC -32001 and do not run. Stdio uses the seeded PayOps demo principal unless GATEWAY_AGENT_KEY is set.";
 
 export interface ContextTaxReport {
   heuristic: { bytesPerToken: number };
@@ -142,17 +131,11 @@ function asStringArray(value: Json | undefined): string[] {
 
 export type GatewayRequest = http.IncomingMessage | Request;
 
-export interface JsonRpcError {
-  code: number;
-  message: string;
-  data?: unknown;
-}
-
-export interface JsonRpcResponse {
-  jsonrpc: "2.0";
-  id: Json;
-  result?: unknown;
-  error?: JsonRpcError;
+function headerSession(req?: GatewayRequest): string {
+  if (!req) return "";
+  if (req instanceof Request) return req.headers.get("x-cubiczan-session") ?? "";
+  const raw = req.headers["x-cubiczan-session"];
+  return typeof raw === "string" ? raw : Array.isArray(raw) ? (raw[0] ?? "") : "";
 }
 
 function normalizePath(pathname: string): string {
@@ -170,7 +153,7 @@ function isHealthPath(pathname: string): boolean {
 function delegatedWebPath(method: string, pathname: string): boolean {
   if (isHealthPath(pathname)) return true;
   if (pathname === "/mcp" || pathname === "/api") return true;
-  if (pathname === "/" && (method === "POST" || method === "OPTIONS" || method === "DELETE")) return true;
+  if (pathname === "/" && (method === "POST" || method === "OPTIONS")) return true;
   return false;
 }
 
@@ -199,19 +182,6 @@ function jsonResponse(status: number, body: unknown, extra: Record<string, strin
   });
 }
 
-function headerValue(req: http.IncomingMessage, name: string): string {
-  const raw = req.headers[name.toLowerCase()];
-  return typeof raw === "string" ? raw : Array.isArray(raw) ? (raw[0] ?? "") : "";
-}
-
-function headerSession(req: http.IncomingMessage): string {
-  return headerValue(req, "x-cubiczan-session");
-}
-
-function mcpSessionHeader(req: http.IncomingMessage): string {
-  return headerValue(req, "mcp-session-id").trim();
-}
-
 export class GovernedGateway {
   readonly ledger: AuditLedger;
   readonly credentials = new Map<string, Credential>();
@@ -219,55 +189,37 @@ export class GovernedGateway {
   readonly keys = new Map<string, string>();
   readonly catalog = new Map<string, CatalogTool>();
   readonly tools = new Map<string, ToolImpl>();
-  readonly packs: ContextPackStore;
-  readonly sessionStore: SessionStore;
-  readonly sessionMode: SessionMode;
-  readonly replicaId: string;
+  readonly packs = new ContextPackStore();
   readonly thresholds: TaxThresholds;
-  readonly claims: ClaimAllowlistFixture;
+  readonly claims: ClaimAllowlistSeed;
   private seq = 0;
 
   constructor(private readonly options: GatewayOptions = {}) {
     this.ledger = new AuditLedger(options.auditKey ?? "gateway-demo-key");
     this.thresholds = { ...DEFAULT_TAX_THRESHOLDS, ...options.taxThresholds };
-    this.claims = options.claimFixture ?? loadClaimAllowlistFixture();
-    this.sessionMode = options.sessionMode ?? parseSessionMode(process.env.MCP_SESSION_MODE);
-    this.replicaId = defaultReplicaId(options.replicaId);
-    this.sessionStore = options.sessionStore ?? new InMemorySessionStore();
-    this.packs = new ContextPackStore({ store: this.sessionStore, replicaId: this.replicaId });
+    this.claims = options.claimFixture ?? defaultClaimAllowlist();
     for (const def of builtInCatalog()) this.catalog.set(def.name, def);
 
-    this.tools.set("echo.ping", (args, principal, host) => ({
+    this.tools.set("echo.ping", (args, principal) => ({
       pong: true,
       echo: args,
       principal,
-      host,
     }));
-    this.tools.set("stripe.charge", (args, principal, host) => ({
+    this.tools.set("stripe.charge", (args, principal) => ({
       simulated: true,
       amountCents: args.amountCents ?? 0,
       principal,
-      host,
     }));
-    this.tools.set("search.web", (args, principal, host) => ({
+    this.tools.set("search.web", (args, principal) => ({
       hits: [],
       query: args.query ?? "",
       principal,
-      host,
-    }));
-    this.tools.set("index.query", (args, principal, host) => ({
-      hits: [],
-      query: args.query ?? "",
-      tenant: host.tenant,
-      index: host.index,
-      principal,
-      host,
     }));
     this.tools.set("context.inspect", (args, principal) => this.inspectContext(principal, args));
     this.tools.set("context.need", (args, principal) => this.needContext(principal, args) as unknown as Json);
-    this.tools.set("docs.mega_schema", (_args, principal, host) => {
+    this.tools.set("docs.mega_schema", (_args, principal) => {
       const tax = this.toolTax("docs.mega_schema");
-      return { accepted: true, principal, host, tokens: tax?.tokens ?? 0, bytes: tax?.bytes ?? 0 };
+      return { accepted: true, principal, tokens: tax?.tokens ?? 0, bytes: tax?.bytes ?? 0 };
     });
   }
 
@@ -281,6 +233,7 @@ export class GovernedGateway {
     const humanKey = process.env.GATEWAY_HUMAN_KEY ?? "mcp_human_controller_demo";
     const researchKey = process.env.GATEWAY_RESEARCH_KEY ?? "mcp_agt_research_demo";
 
+    const map = this.claims.mappings;
     this.registerAgent(
       {
         id: "agt_payops",
@@ -289,7 +242,7 @@ export class GovernedGateway {
         displayName: "PayOps Runner",
       },
       agentKey,
-      ["echo.ping", "stripe.charge", "index.query"],
+      toolsForScopes(["tools:echo", "tools:payments"], map),
       50_000,
       5_000,
     );
@@ -301,7 +254,7 @@ export class GovernedGateway {
         displayName: "Research Scout",
       },
       researchKey,
-      ["echo.ping", "search.web", "index.query"],
+      toolsForScopes(["tools:echo", "tools:search"], map),
       10_000,
       1_000,
     );
@@ -313,7 +266,7 @@ export class GovernedGateway {
         displayName: "Controller",
       },
       humanKey,
-      ["echo.ping"],
+      toolsForScopes(["tools:echo"], map),
       0,
       0,
     );
@@ -370,268 +323,56 @@ export class GovernedGateway {
     return Boolean(cred && cred.hash === hash(secret));
   }
 
-  authenticate(req: http.IncomingMessage): BearerAuthResult {
-    return this.authenticateBearer(bearer(req));
-  }
-
-  authenticateBearer(token: string | undefined): BearerAuthResult {
-    if (!token) return { ok: false, reason: "missing" };
-
-    const id = this.keys.get(hash(token));
-    if (id) {
-      const agent = this.agents.get(id);
-      if (!agent) return { ok: false, reason: "invalid" };
-      return { ok: true, principal: { ...agent.principal }, source: "api-key" };
-    }
-
-    const verified = verifyFixtureJwt(token, this.claims, this.options.jwtNow);
-    if (!verified.ok) return { ok: false, reason: verified.reason };
-    const agent = this.agents.get(verified.claims.sub);
-    if (!agent) return { ok: false, reason: "invalid" };
-    return {
-      ok: true,
-      principal: principalFromJwtClaims(agent.principal, verified.claims),
-      source: "jwt",
-    };
+  resolvePrincipal(req: http.IncomingMessage): Principal | undefined {
+    return this.principalForToken(bearer(req));
   }
 
   principalForToken(token: string | undefined): Principal | undefined {
-    const result = this.authenticateBearer(token);
-    return result.ok ? result.principal : undefined;
+    if (!token) return undefined;
+    const id = this.keys.get(hash(token));
+    if (!id) return undefined;
+    return this.agents.get(id)?.principal;
   }
 
-  resolvePrincipal(req: http.IncomingMessage): Principal | undefined {
-    const result = this.authenticate(req);
-    return result.ok ? result.principal : undefined;
+  stdioPrincipal(): Principal {
+    const token = process.env.GATEWAY_AGENT_KEY ?? "mcp_agt_payops_demo";
+    const principal = this.principalForToken(token);
+    if (!principal) throw new Error("stdio principal is not seeded; call seedDemo() first");
+    return principal;
   }
 
-  denyBearer(res: http.ServerResponse, reason: string): void {
-    sendJson(res, 401, { error: "unauthorized", reason });
-  }
-
-  attachPrincipal(
-    payload: Record<string, Json>,
-    principal: Principal,
-    host?: HostBindings,
-  ): Record<string, Json> {
+  attachPrincipal(payload: Record<string, Json>, principal: Principal): Record<string, Json> {
     const params = asObject(payload.params);
     const meta = asObject(params._meta);
     const cubiczan = asObject(meta.cubiczan);
-    const scopes = (principal.scopes ?? []) as unknown as Json;
     cubiczan.principal = principal as unknown as Json;
-    cubiczan.scopes = scopes;
-    if (host) cubiczan.host = host as unknown as Json;
     meta.cubiczan = cubiczan;
-    meta.principal = principal as unknown as Json;
-    meta.scopes = scopes;
     params._meta = meta;
     return { ...payload, params };
   }
 
-  metaFor(principal: Principal, extra: Record<string, Json> = {}): Record<string, Json> {
-    const scopes = (principal.scopes ?? []) as unknown as Json;
-    return {
-      principal: principal as unknown as Json,
-      scopes,
-      cubiczan: { principal: principal as unknown as Json, scopes, ...extra },
-    };
-  }
-
   sessionIdFor(principal: Principal, params: Record<string, Json>, req?: GatewayRequest): string {
     const meta = asObject(asObject(params._meta).cubiczan);
-    const cubiczanHeader = req ? (req instanceof Request ? (req.headers.get("x-cubiczan-session") ?? "") : headerSession(req)) : "";
-    const transportHeader =
-      req && this.sessionMode !== "stateless"
-        ? (req instanceof Request ? (req.headers.get("mcp-session-id") ?? "").trim() : mcpSessionHeader(req))
-        : "";
     return resolveSessionId(
       principal.id,
       typeof params.sessionId === "string" ? params.sessionId : undefined,
-      cubiczanHeader || transportHeader,
+      headerSession(req),
       typeof meta.sessionId === "string" ? meta.sessionId : undefined,
     );
-  }
-
-  mintTransportSession(principal: Principal): { id: string } {
-    const id = newId("mcp");
-    this.packs.getOrCreate(
-      id,
-      principal.id,
-      defaultSeedTools(this.grantedTools(principal), [...this.catalog.values()]),
-    );
-    this.ledger.append({
-      event: "session.opened",
-      actor: principal.id,
-      inputs: { sessionId: id, mode: this.sessionMode, replicaId: this.replicaId },
-      sources: ["streamable-http"],
-    });
-    return { id };
-  }
-
-  validateTransportSession(
-    req: http.IncomingMessage,
-    principal: Principal,
-  ): { sessionId: string } | { denied: SessionDenied } {
-    if (!requiresTransportSession(this.sessionMode)) {
-      return { sessionId: this.sessionIdFor(principal, {}, req) };
-    }
-    const sessionId = mcpSessionHeader(req);
-    if (!sessionId) {
-      return {
-        denied: sessionDenied("MISSING_SESSION", "Mcp-Session-Id is required in this deployment mode", {
-          hint: "Call initialize first, pin ingress affinity to one replica, or set MCP_SESSION_MODE=stateless.",
-        }),
-      };
-    }
-    const record = this.sessionStore.get(sessionId);
-    if (!record) {
-      if (this.sessionMode === "sticky") {
-        return {
-          denied: sessionDenied("SESSION_STICKY_MISMATCH", "MCP session is unknown on this replica", {
-            sessionId,
-            hint: "Session was minted on another replica or the replica was replaced. Re-run initialize, enable a shared SessionStore, or switch to STATELESS.",
-          }),
-        };
-      }
-      return {
-        denied: sessionDenied("UNKNOWN_SESSION", "MCP session is unknown or expired", {
-          sessionId,
-          hint: "Re-run initialize. The shared store has no record for this Mcp-Session-Id.",
-        }),
-      };
-    }
-    if (this.sessionMode === "sticky" && record.replicaId !== this.replicaId) {
-      return {
-        denied: sessionDenied("SESSION_STICKY_MISMATCH", "MCP session is bound to another replica", {
-          sessionId,
-          hint: `Session replica is ${record.replicaId}; this process is ${this.replicaId}. Use ingress affinity, a shared SessionStore, or STATELESS.`,
-        }),
-      };
-    }
-    if (record.principalId !== principal.id) {
-      return {
-        denied: sessionDenied("SESSION_PRINCIPAL_MISMATCH", "session belongs to another principal", {
-          sessionId,
-          hint: "The Bearer principal does not own this Mcp-Session-Id.",
-        }),
-      };
-    }
-    return { sessionId };
-  }
-
-  private sessionResponseHeaders(sessionId?: string): http.OutgoingHttpHeaders | undefined {
-    if (!sessionId || this.sessionMode === "stateless") return undefined;
-    return { "Mcp-Session-Id": sessionId };
-  }
-
-  private denySession(
-    res: http.ServerResponse,
-    id: Json,
-    denied: SessionDenied,
-    principalId?: string,
-  ): void {
-    this.ledger.append({
-      event: "session.denied",
-      actor: principalId ?? "anonymous",
-      inputs: {
-        reason: denied.reason,
-        sessionId: denied.sessionId ?? null,
-        mode: this.sessionMode,
-        replicaId: this.replicaId,
-      },
-      sources: ["streamable-http"],
-    });
-    sendJson(
-      res,
-      denied.httpStatus,
-      {
-        jsonrpc: "2.0",
-        id,
-        error: {
-          code: SESSION_RPC_CODE,
-          message: denied.message,
-          data: {
-            reason: denied.reason,
-            replicaId: this.replicaId,
-            mode: this.sessionMode,
-            sessionId: denied.sessionId ?? null,
-            hint: denied.hint,
-          },
-        },
-      },
-      this.sessionResponseHeaders(denied.sessionId),
-    );
-  }
-
-  private headerValue(req: GatewayRequest | undefined, name: string): string {
-    if (!req) return "";
-    if (req instanceof Request) return req.headers.get(name) ?? "";
-    const raw = req.headers[name];
-    return typeof raw === "string" ? raw : Array.isArray(raw) ? (raw[0] ?? "") : "";
-  }
-
-  private queryValue(req: GatewayRequest | undefined, name: string): string {
-    if (!req) return "";
-    if (req instanceof Request) return new URL(req.url).searchParams.get(name) ?? "";
-    const host = req.headers.host ?? "localhost";
-    const url = new URL(req.url ?? "/", `http://${host}`);
-    return url.searchParams.get(name) ?? "";
-  }
-
-  hostBindingsFor(
-    principal: Principal,
-    params: Record<string, Json>,
-    req?: GatewayRequest,
-  ): HostBindResult {
-    const hostMeta = asObject(asObject(asObject(params._meta).cubiczan).host);
-    return bindHostBindings({
-      principal,
-      tenantClaim: {
-        header: this.headerValue(req, "x-cubiczan-tenant"),
-        query: this.queryValue(req, "tenant"),
-        meta: typeof hostMeta.tenant === "string" ? hostMeta.tenant : "",
-      },
-      indexClaim: {
-        header: this.headerValue(req, "x-cubiczan-index"),
-        query: this.queryValue(req, "index"),
-        meta: typeof hostMeta.index === "string" ? hostMeta.index : "",
-      },
-      vault: [...this.credentials.values()].map((cred) => ({ name: cred.name, version: cred.version })),
-    });
-  }
-
-  denyHost(principal: Principal, reason: string, invented: string[], name?: string): never {
-    this.ledger.append({
-      event: "host.meta.denied",
-      actor: principal.id,
-      inputs: { reason, invented, name: name ?? null },
-      sources: ["host-meta"],
-    });
-    throw Object.assign(new Error(reason), {
-      rpc: { code: -32006, message: reason, data: { invented } },
-    });
   }
 
   allowlistOf(principal: Principal): string[] {
     return this.agents.get(principal.id)?.allowlist ?? [];
   }
 
-  grantedTools(principal: Principal): string[] {
-    return effectiveAllowlist(this.allowlistOf(principal), principal, this.claims.mappings);
-  }
-
   toolTax(name: string): ToolTax | undefined {
     const def = this.catalog.get(name);
     if (!def) return undefined;
-    const listed = toListedTool(def);
-    return measureToolSchema({ ...def, ...listed }, this.thresholds.toolTokens);
+    return measureToolSchema(def, this.thresholds.toolTokens);
   }
 
   estateTaxes(): ToolTax[] {
-    return [...this.catalog.values()].map((def) => {
-      const listed = toListedTool(def);
-      return measureToolSchema({ ...def, ...listed }, this.thresholds.toolTokens);
-    });
+    return [...this.catalog.values()].map((def) => measureToolSchema(def, this.thresholds.toolTokens));
   }
 
   estateReport(): ContextTaxReport["estate"] {
@@ -663,7 +404,7 @@ export class GovernedGateway {
   contextTaxReport(principal: Principal, sessionId?: string): ContextTaxReport {
     const sid = sessionId ?? `ses_${principal.id}`;
     const catalog = [...this.catalog.values()];
-    const session = this.packs.ensure(sid, principal.id, this.grantedTools(principal), catalog);
+    const session = this.packs.ensure(sid, principal.id, this.allowlistOf(principal), catalog);
     const taxes = session.tools
       .map((name) => this.toolTax(name))
       .filter((tax): tax is ToolTax => Boolean(tax));
@@ -717,7 +458,7 @@ export class GovernedGateway {
     const result = this.packs.admit(
       sessionId,
       principal.id,
-      this.grantedTools(principal),
+      this.allowlistOf(principal),
       [...this.catalog.values()],
       request,
     );
@@ -742,17 +483,17 @@ export class GovernedGateway {
 
   listTools(principal: Principal, params: Record<string, Json>, req?: GatewayRequest): {
     tools: Array<{ name: string; description: string; inputSchema: Json }>;
-    _meta: Record<string, Json>;
+    _meta: { cubiczan: { principal: Principal; sessionId: string; tax: ListTax } };
   } {
     const sessionId = this.sessionIdFor(principal, params, req);
     const catalog = [...this.catalog.values()];
+    const session = this.packs.ensure(sessionId, principal.id, this.allowlistOf(principal), catalog);
     const need = asStringArray(params.need);
     const pack = typeof params.pack === "string" ? params.pack : undefined;
     if (need.length > 0 || pack) this.admitNeed(principal, sessionId, { tools: need, pack });
-    const session = this.packs.ensure(sessionId, principal.id, this.grantedTools(principal), catalog);
 
     const mode = params.mode === "full" ? "full" : "pack";
-    const allowlist = this.grantedTools(principal);
+    const allowlist = this.allowlistOf(principal);
     const names =
       mode === "full"
         ? [...new Set([...allowlist, "context.inspect", "context.need"])]
@@ -798,16 +539,9 @@ export class GovernedGateway {
       });
     }
 
-    const hostBound = this.hostBindingsFor(principal, params, req);
-    if (!hostBound.ok) this.denyHost(principal, hostBound.reason, hostBound.invented, "tools/list");
-
     return {
       tools: listed,
-      _meta: this.metaFor(principal, {
-        sessionId,
-        tax: tax as unknown as Json,
-        host: hostBound.host as unknown as Json,
-      }),
+      _meta: { cubiczan: { principal, sessionId, tax } },
     };
   }
 
@@ -835,15 +569,10 @@ export class GovernedGateway {
     });
   }
 
-  async dispatchTool(
-    principal: Principal,
-    name: string,
-    args: Record<string, Json>,
-    host: HostBindings,
-  ): Promise<Json> {
+  async dispatchTool(principal: Principal, name: string, args: Record<string, Json>): Promise<Json> {
     const agent = this.agents.get(principal.id);
     if (!agent) throw new Error("unknown principal");
-    if (!canExpose(name, this.grantedTools(principal))) {
+    if (!canExpose(name, agent.allowlist)) {
       const error = { code: -32001, message: `tool ${name} is not on the allowlist` };
       this.ledger.append({
         event: "tool.denied",
@@ -852,22 +581,6 @@ export class GovernedGateway {
         sources: ["allowlist"],
       });
       throw Object.assign(new Error(error.message), { rpc: error });
-    }
-
-    const def = this.catalog.get(name);
-    const extraHostKeys = [...(def?.hostOnly ?? []), ...this.credentials.keys()];
-    const invented = inventedHostKeys(args, extraHostKeys);
-    if (invented.length > 0) {
-      stripHostOnlyKeys(args, extraHostKeys);
-      this.denyHost(principal, `model invented host-only argument(s): ${invented.join(", ")}`, invented, name);
-    }
-    for (const key of def?.hostOnly ?? []) {
-      if (key === "index" && !host.index) {
-        this.denyHost(principal, "host index is not bound", ["index"], name);
-      }
-      if (key === "tenant" && !host.tenant) {
-        this.denyHost(principal, "host tenant is not bound", ["tenant"], name);
-      }
     }
 
     const amountCents = Number(args.amountCents ?? 0) || 0;
@@ -918,7 +631,7 @@ export class GovernedGateway {
 
     const impl = this.tools.get(name);
     if (!impl) throw new Error(`unknown tool ${name}`);
-    const result = impl(args, principal, host);
+    const result = impl(args, principal);
     this.ledger.append({
       event: "tool.called",
       actor: principal.id,
@@ -929,349 +642,6 @@ export class GovernedGateway {
     return result;
   }
 
-  createHttpServer(): http.Server {
-    return createServer(async (req, res, url, body) => {
-      const path = normalizePath(url.pathname);
-      if ((req.method === "GET" || req.method === "HEAD") && isHealthPath(path)) {
-        const webRes = await this.handleWebRequest(incomingToRequest(req, url, body));
-        await sendWebResponse(res, webRes);
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/mcp/sse") {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          this.denyBearer(res, auth.reason);
-          return;
-        }
-        const principal = auth.principal;
-        const checked = this.validateTransportSession(req, principal);
-        if ("denied" in checked) {
-          this.denySession(res, null, checked.denied, principal.id);
-          return;
-        }
-        const sse = openSse(res);
-        this.seq += 1;
-        const frame = {
-          jsonrpc: "2.0",
-          method: "notifications/message",
-          params: {
-            level: "info",
-            message: "sse-open",
-            _meta: this.metaFor(principal),
-          },
-        };
-        sse.send("message", frame, String(this.seq));
-        if (url.searchParams.get("once") === "1") sse.close();
-        return;
-      }
-
-      const obj = asObject(body);
-
-      if (req.method === "GET" && url.pathname === "/v1/context/tax") {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          this.denyBearer(res, auth.reason);
-          return;
-        }
-        const principal = auth.principal;
-        const sessionId = url.searchParams.get("session") ?? undefined;
-        try {
-          sendJson(res, 200, this.contextTaxReport(principal, sessionId));
-        } catch (error) {
-          const mismatch = error && typeof error === "object" && "code" in error && (error as { code: string }).code === "session_mismatch";
-          sendJson(res, mismatch ? 409 : 500, {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/v1/context/packs") {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          this.denyBearer(res, auth.reason);
-          return;
-        }
-        const principal = auth.principal;
-        const estate = this.estateReport();
-        sendJson(res, 200, {
-          heuristic: { bytesPerToken: 4 },
-          thresholds: this.thresholds,
-          packs: estate.packs,
-          servers: estate.servers,
-        });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/context/need") {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          this.denyBearer(res, auth.reason);
-          return;
-        }
-        const principal = auth.principal;
-        const sessionId = this.sessionIdFor(principal, obj, req);
-        try {
-          sendJson(res, 200, this.admitNeed(principal, sessionId, {
-            tools: asStringArray(obj.tools),
-            pack: typeof obj.pack === "string" ? obj.pack : undefined,
-          }));
-        } catch (error) {
-          const mismatch = error && typeof error === "object" && "code" in error && (error as { code: string }).code === "session_mismatch";
-          sendJson(res, mismatch ? 409 : 500, {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/credentials") {
-        const principal = this.resolvePrincipal(req);
-        if (!principal || principal.kind === "agent") {
-          sendJson(res, 401, { error: "operator required" });
-          return;
-        }
-        const name = String(obj.name ?? "");
-        const secret = String(obj.secret ?? "");
-        if (!name || !secret) {
-          sendJson(res, 400, { error: "name and secret required" });
-          return;
-        }
-        sendJson(res, 200, this.putCredential(name, secret));
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname.startsWith("/v1/credentials/") && url.pathname.endsWith("/rotate")) {
-        const principal = this.resolvePrincipal(req);
-        if (!principal || principal.kind === "agent") {
-          sendJson(res, 401, { error: "operator required" });
-          return;
-        }
-        const name = url.pathname.split("/")[3];
-        const secret = String(obj.secret ?? newId("tok"));
-        try {
-          sendJson(res, 200, { ...this.rotateCredential(name, secret), secret });
-        } catch (error) {
-          sendJson(res, 404, { error: error instanceof Error ? error.message : String(error) });
-        }
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/credentials/verify") {
-        const name = String(obj.name ?? "");
-        const secret = String(obj.secret ?? "");
-        sendJson(res, 200, { ok: this.verifyCredential(name, secret) });
-        return;
-      }
-
-      if (req.method === "DELETE" && (url.pathname === "/mcp" || url.pathname === "/")) {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          this.denyBearer(res, auth.reason);
-          return;
-        }
-        const principal = auth.principal;
-        const checked = this.validateTransportSession(req, principal);
-        if ("denied" in checked) {
-          this.denySession(res, null, checked.denied, principal.id);
-          return;
-        }
-        if (requiresTransportSession(this.sessionMode)) {
-          this.sessionStore.delete(checked.sessionId);
-          this.ledger.append({
-            event: "session.closed",
-            actor: principal.id,
-            inputs: { sessionId: checked.sessionId, mode: this.sessionMode, replicaId: this.replicaId },
-            sources: ["streamable-http"],
-          });
-        }
-        sendJson(res, 200, { ok: true, closed: checked.sessionId }, this.sessionResponseHeaders(checked.sessionId));
-        return;
-      }
-
-      if (req.method === "POST" && (url.pathname === "/mcp" || url.pathname === "/")) {
-        const auth = this.authenticate(req);
-        if (!auth.ok) {
-          this.denyBearer(res, auth.reason);
-          return;
-        }
-        const principal = auth.principal;
-        const method = String(obj.method ?? "");
-        const id = obj.id ?? null;
-        if (method === "initialize") {
-          const minted = requiresTransportSession(this.sessionMode)
-            ? this.mintTransportSession(principal)
-            : undefined;
-          sendJson(
-            res,
-            200,
-            {
-              jsonrpc: "2.0",
-              id,
-              result: {
-                protocolVersion: "2025-03-26",
-                serverInfo: { name: "governed-mcp-gateway", version: "0.1.0" },
-                capabilities: {
-                  tools: {},
-                  logging: {},
-                  cubiczan: { sessionMode: this.sessionMode, replicaId: this.replicaId },
-                },
-              },
-            },
-            this.sessionResponseHeaders(minted?.id),
-          );
-          return;
-        }
-        const checked = this.validateTransportSession(req, principal);
-        if ("denied" in checked) {
-          this.denySession(res, id, checked.denied, principal.id);
-          return;
-        }
-        const sessionHeaders = this.sessionResponseHeaders(
-          requiresTransportSession(this.sessionMode) ? checked.sessionId : undefined,
-        );
-        if (method === "tools/list") {
-          try {
-            sendJson(
-              res,
-              200,
-              {
-                jsonrpc: "2.0",
-                id,
-                result: this.listTools(principal, asObject(obj.params), req),
-              },
-              sessionHeaders,
-            );
-          } catch (error) {
-            const rpc = (error as { rpc?: { code: number; message: string; data?: unknown } }).rpc;
-            const mismatch = error && typeof error === "object" && "code" in error && (error as { code: string }).code === "session_mismatch";
-            sendJson(
-              res,
-              200,
-              {
-                jsonrpc: "2.0",
-                id,
-                error:
-                  rpc ??
-                  (mismatch
-                    ? { code: -32007, message: error instanceof Error ? error.message : "session mismatch" }
-                    : { code: -32000, message: error instanceof Error ? error.message : String(error) }),
-              },
-              sessionHeaders,
-            );
-          }
-          return;
-        }
-        if (method === "tools/call") {
-          const paramsIn = asObject(obj.params);
-          const claimed = asObject(asObject(asObject(paramsIn._meta).cubiczan).principal);
-          const impersonation = claimedPrincipalConflict(principal, claimed);
-          if (impersonation) {
-            try {
-              this.denyHost(principal, impersonation, ["principal"], String(paramsIn.name ?? ""));
-            } catch (error) {
-              const rpc = (error as { rpc?: { code: number; message: string; data?: unknown } }).rpc;
-              sendJson(
-                res,
-                200,
-                {
-                  jsonrpc: "2.0",
-                  id,
-                  error: rpc ?? { code: -32006, message: impersonation },
-                },
-                sessionHeaders,
-              );
-              return;
-            }
-          }
-          const hostBound = this.hostBindingsFor(principal, paramsIn, req);
-          if (!hostBound.ok) {
-            try {
-              this.denyHost(principal, hostBound.reason, hostBound.invented, String(paramsIn.name ?? ""));
-            } catch (error) {
-              const rpc = (error as { rpc?: { code: number; message: string; data?: unknown } }).rpc;
-              sendJson(
-                res,
-                200,
-                {
-                  jsonrpc: "2.0",
-                  id,
-                  error: rpc ?? { code: -32006, message: hostBound.reason },
-                },
-                sessionHeaders,
-              );
-              return;
-            }
-          }
-          const attached = this.attachPrincipal(obj, principal, hostBound.host);
-          const params = asObject(attached.params);
-          const name = String(params.name ?? "");
-          const args = asObject(params.arguments);
-          try {
-            const result = await this.dispatchTool(principal, name, args, hostBound.host);
-            sendJson(
-              res,
-              200,
-              {
-                jsonrpc: "2.0",
-                id,
-                result: {
-                  content: [{ type: "text", text: JSON.stringify(result) }],
-                  _meta: this.metaFor(principal, { host: hostBound.host as unknown as Json }),
-                  structuredContent: result,
-                },
-              },
-              sessionHeaders,
-            );
-          } catch (error) {
-            const rpc = (error as { rpc?: { code: number; message: string; data?: unknown } }).rpc;
-            sendJson(
-              res,
-              200,
-              {
-                jsonrpc: "2.0",
-                id,
-                error: rpc ?? { code: -32000, message: error instanceof Error ? error.message : String(error) },
-              },
-              sessionHeaders,
-            );
-          }
-          return;
-        }
-        sendJson(res, 200, {
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32601, message: `unknown method ${method}` },
-        });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/locks") {
-        const principal = this.resolvePrincipal(req);
-        if (!principal || principal.kind === "agent") {
-          sendJson(res, 401, { error: "human required" });
-          return;
-        }
-        const decision = obj.decision === "reject" ? "reject" : "approve";
-        sendJson(res, 200, applyHumanLock(decision, String(obj.notes ?? "")));
-        return;
-      }
-
-      sendJson(res, 404, { error: "not found" });
-    });
-  }
-
-  healthPayload(): Record<string, Json> {
-    return {
-      ok: true,
-      service: "governed-mcp-gateway",
-      transport: "streamable-http",
-      mode: this.sessionMode,
-      replicaId: this.replicaId,
-    };
-  }
-
   initializeResult(): Record<string, Json> {
     return {
       protocolVersion: "2025-03-26",
@@ -1279,12 +649,19 @@ export class GovernedGateway {
         name: "governed-mcp-gateway",
         version: "0.1.0",
         title: "Governed MCP Gateway",
+        websiteUrl: "https://github.com/Cubiczan/governed-mcp-gateway",
       },
-      capabilities: {
-        tools: { listChanged: false },
-        logging: {},
-        cubiczan: { sessionMode: this.sessionMode, replicaId: this.replicaId },
-      },
+      capabilities: { tools: { listChanged: false }, logging: {} },
+      instructions: MCP_INSTRUCTIONS,
+    };
+  }
+
+  healthPayload(): Record<string, Json> {
+    return {
+      ok: true,
+      service: "governed-mcp-gateway",
+      transport: "streamable-http",
+      mode: "stateless",
     };
   }
 
@@ -1313,19 +690,11 @@ export class GovernedGateway {
       return jsonResponse(404, { error: "not found" }, cors);
     }
 
-    const auth = this.authenticateBearer(bearerFromAuthorization(request.headers.get("authorization")));
-    if (!auth.ok) {
-      return jsonResponse(401, { error: "unauthorized", reason: auth.reason }, {
+    const principal = this.principalForToken(bearerFromAuthorization(request.headers.get("authorization")));
+    if (!principal) {
+      return jsonResponse(401, { error: "unauthorized" }, {
         ...cors,
         "www-authenticate": 'Bearer realm="governed-mcp-gateway", error="invalid_token"',
-      });
-    }
-    const principal = auth.principal;
-
-    if (request.method === "DELETE") {
-      return jsonResponse(200, { ok: true, closed: request.headers.get("mcp-session-id") ?? null }, {
-        ...cors,
-        "mcp-protocol-version": "2025-03-26",
       });
     }
 
@@ -1368,16 +737,7 @@ export class GovernedGateway {
       return { jsonrpc: "2.0", id, result: {} };
     }
     if (method === "tools/list") {
-      try {
-        return { jsonrpc: "2.0", id, result: this.listTools(principal, asObject(obj.params), req) };
-      } catch (error) {
-        const rpc = (error as { rpc?: JsonRpcError }).rpc;
-        return {
-          jsonrpc: "2.0",
-          id,
-          error: rpc ?? { code: -32000, message: error instanceof Error ? error.message : String(error) },
-        };
-      }
+      return { jsonrpc: "2.0", id, result: this.listTools(principal, asObject(obj.params), req) };
     }
     if (method === "resources/list") {
       return { jsonrpc: "2.0", id, result: { resources: [] } };
@@ -1386,38 +746,18 @@ export class GovernedGateway {
       return { jsonrpc: "2.0", id, result: { prompts: [] } };
     }
     if (method === "tools/call") {
-      const paramsIn = asObject(obj.params);
-      const claimed = asObject(asObject(asObject(paramsIn._meta).cubiczan).principal);
-      const impersonation = claimedPrincipalConflict(principal, claimed);
-      if (impersonation) {
-        try {
-          this.denyHost(principal, impersonation, ["principal"], String(paramsIn.name ?? ""));
-        } catch (error) {
-          const rpc = (error as { rpc?: JsonRpcError }).rpc;
-          return { jsonrpc: "2.0", id, error: rpc ?? { code: -32006, message: impersonation } };
-        }
-      }
-      const hostBound = this.hostBindingsFor(principal, paramsIn, req);
-      if (!hostBound.ok) {
-        try {
-          this.denyHost(principal, hostBound.reason, hostBound.invented, String(paramsIn.name ?? ""));
-        } catch (error) {
-          const rpc = (error as { rpc?: JsonRpcError }).rpc;
-          return { jsonrpc: "2.0", id, error: rpc ?? { code: -32006, message: hostBound.reason } };
-        }
-      }
-      const attached = this.attachPrincipal(obj, principal, hostBound.host);
+      const attached = this.attachPrincipal(obj, principal);
       const params = asObject(attached.params);
       const name = String(params.name ?? "");
       const args = asObject(params.arguments);
       try {
-        const result = await this.dispatchTool(principal, name, args, hostBound.host);
+        const result = await this.dispatchTool(principal, name, args);
         return {
           jsonrpc: "2.0",
           id,
           result: {
             content: [{ type: "text", text: JSON.stringify(result) }],
-            _meta: this.metaFor(principal, { host: hostBound.host as unknown as Json }),
+            _meta: { cubiczan: { principal } },
             structuredContent: result,
           },
         };
@@ -1431,6 +771,134 @@ export class GovernedGateway {
       }
     }
     return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown method ${method}` } };
+  }
+
+  createHttpServer(): http.Server {
+    return createServer(async (req, res, url, body) => {
+      if (req.method === "GET" && url.pathname === "/mcp/sse") {
+        const principal = this.resolvePrincipal(req);
+        if (!principal) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const sse = openSse(res);
+        this.seq += 1;
+        const frame = {
+          jsonrpc: "2.0",
+          method: "notifications/message",
+          params: {
+            level: "info",
+            message: "sse-open",
+            _meta: { cubiczan: { principal } },
+          },
+        };
+        sse.send("message", frame, String(this.seq));
+        if (url.searchParams.get("once") === "1") sse.close();
+        return;
+      }
+
+      const path = normalizePath(url.pathname);
+      if (delegatedWebPath(req.method ?? "GET", path)) {
+        const webRes = await this.handleWebRequest(incomingToRequest(req, url, body));
+        await sendWebResponse(res, webRes);
+        return;
+      }
+
+      const obj = asObject(body);
+
+      if (req.method === "GET" && url.pathname === "/v1/context/tax") {
+        const principal = this.resolvePrincipal(req);
+        if (!principal) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const sessionId = url.searchParams.get("session") ?? undefined;
+        sendJson(res, 200, this.contextTaxReport(principal, sessionId));
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/context/packs") {
+        const principal = this.resolvePrincipal(req);
+        if (!principal) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const estate = this.estateReport();
+        sendJson(res, 200, {
+          heuristic: { bytesPerToken: 4 },
+          thresholds: this.thresholds,
+          packs: estate.packs,
+          servers: estate.servers,
+        });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/context/need") {
+        const principal = this.resolvePrincipal(req);
+        if (!principal) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const sessionId = this.sessionIdFor(principal, obj, req);
+        sendJson(res, 200, this.admitNeed(principal, sessionId, {
+          tools: asStringArray(obj.tools),
+          pack: typeof obj.pack === "string" ? obj.pack : undefined,
+        }));
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/credentials") {
+        const principal = this.resolvePrincipal(req);
+        if (!principal || principal.kind === "agent") {
+          sendJson(res, 401, { error: "operator required" });
+          return;
+        }
+        const name = String(obj.name ?? "");
+        const secret = String(obj.secret ?? "");
+        if (!name || !secret) {
+          sendJson(res, 400, { error: "name and secret required" });
+          return;
+        }
+        sendJson(res, 200, this.putCredential(name, secret));
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname.startsWith("/v1/credentials/") && url.pathname.endsWith("/rotate")) {
+        const principal = this.resolvePrincipal(req);
+        if (!principal || principal.kind === "agent") {
+          sendJson(res, 401, { error: "operator required" });
+          return;
+        }
+        const name = url.pathname.split("/")[3];
+        const secret = String(obj.secret ?? newId("tok"));
+        try {
+          sendJson(res, 200, { ...this.rotateCredential(name, secret), secret });
+        } catch (error) {
+          sendJson(res, 404, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/credentials/verify") {
+        const name = String(obj.name ?? "");
+        const secret = String(obj.secret ?? "");
+        sendJson(res, 200, { ok: this.verifyCredential(name, secret) });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/locks") {
+        const principal = this.resolvePrincipal(req);
+        if (!principal || principal.kind === "agent") {
+          sendJson(res, 401, { error: "human required" });
+          return;
+        }
+        const decision = obj.decision === "reject" ? "reject" : "approve";
+        sendJson(res, 200, applyHumanLock(decision, String(obj.notes ?? "")));
+        return;
+      }
+
+      sendJson(res, 404, { error: "not found" });
+    });
   }
 }
 
